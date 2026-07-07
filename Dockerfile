@@ -2,9 +2,9 @@ FROM python:3.11
 
 WORKDIR /app
 
-# Install dependencies
+# Install dependencies — use default-jdk (which pulls openjdk-17 in trixie)
 RUN apt-get update && apt-get install -y \
-    openjdk-17-jdk \
+    default-jdk \
     wget \
     zip \
     unzip \
@@ -20,14 +20,11 @@ RUN wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts
 RUN wget -q https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar \
     -O /usr/local/bin/uber-apk-signer.jar
 
-# Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source
 COPY . .
 
-# Verify installations
 RUN java -version && apktool --version
 
 CMD ["python", "bot.py"]
