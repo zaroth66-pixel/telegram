@@ -49,7 +49,6 @@ asyncio.set_event_loop(loop)
 # ============ FLASK ============
 app = Flask(__name__)
 start_time = time.time()
-application = None
 
 @app.route('/')
 def index():
@@ -1298,13 +1297,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ============ BOT RUNNER ============
+# ============ BOT RUNNER — POLLING MODE ============
 def run_bot():
     global application, loop
 
     async def bot_main():
         global application
         init_db()
-        print("FUD Maker Bot starting (Webhook mode)...")
+        print("FUD Maker Bot starting (Polling mode)...")
         print(f"Developer: {DEVELOPER}")
         print(f"VirusTotal: {'Enabled' if VT_API_KEY else 'Disabled'}")
         print(f"Channel: {'Configured' if CHANNEL_ID else 'Not set'}")
@@ -1336,43 +1336,62 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
+        # ✅ Force delete webhook to avoid conflicts
+        print("Deleting webhook...")
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            print("Webhook deleted.")
+        except Exception as e:
+            print(f"Delete webhook error: {e}")
+
+        await asyncio.sleep(2)
+
+        print("Starting polling with long timeouts...")
         await application.initialize()
         await application.start()
 
-        if WEBHOOK_URL:
-            webhook_full = f"{WEBHOOK_URL}"
-            print(f"Setting webhook to: {webhook_full}")
-            await application.bot.set_webhook(
-                url=webhook_full,
-                allowed_updates=['message', 'callback_query'],
-                drop_pending_updates=True
-            )
-            print("Webhook set successfully!")
-        else:
-            print("WARNING: WEBHOOK_URL not set! Using polling...")
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            await application.updater.start_polling(
-                drop_pending_updates=True,
-                allowed_updates=['message', 'callback_query'],
-                poll_interval=1.0,
-                timeout=10
-            )
+        # ✅ Poll with extended timeouts for APK processing
+        await application.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=['message', 'callback_query'],
+            poll_interval=1.0,
+            timeout=120,           # 2 minutes for long APK builds
+            read_timeout=120,
+            write_timeout=120,
+            connect_timeout=60
+        )
 
         print("Bot is running!")
 
         while True:
             try:
-                if not application.running:
-                    print("Application stopped! Re-initializing...")
-                    await application.initialize()
-                    await application.start()
-                    print("Application re-initialized.")
+                if not application.updater.running:
+                    print("Updater stopped! Restarting...")
+                    await application.updater.start_polling(
+                        drop_pending_updates=True,
+                        allowed_updates=['message', 'callback_query'],
+                        poll_interval=1.0,
+                        timeout=120,
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=60
+                    )
+                    print("Updater restarted!")
             except Exception as e:
                 print(f"Health check error: {e}")
             await asyncio.sleep(10)
 
-    # Run on persistent loop
-    loop.run_until_complete(bot_main())
+    # Run on persistent loop with retry
+    while True:
+        try:
+            loop.run_until_complete(bot_main())
+        except Exception as e:
+            print(f"Bot crashed: {e}")
+            import traceback
+            traceback.print_exc()
+            print("Restarting in 5 seconds...")
+            time.sleep(5)
+
 
 # ============ MAIN ============
 if __name__ == '__main__':
@@ -1386,11 +1405,12 @@ if __name__ == '__main__':
 
     def run_flask():
         port = int(os.environ.get("PORT", 8080))
-        app.run(host='0.0.0.0', port=port)
+        # No webhook routes needed — just health checks
+        app.run(host='0.0.0.0', port=port, debug=False)
 
     # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # Start bot
+    # Start the bot
     run_bot()
