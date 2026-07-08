@@ -42,12 +42,14 @@ DB_PATH = os.path.join(DATA_DIR, "fud_maker.db")
 # ============ DEVELOPER ============
 DEVELOPER = "@benji_v1"
 
+# ============ GLOBAL LOOP ============
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 # ============ FLASK ============
 app = Flask(__name__)
 start_time = time.time()
 application = None
-webhook_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(webhook_loop)
 
 @app.route('/')
 def index():
@@ -59,23 +61,30 @@ def health():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    global application, webhook_loop
+    global application, loop
+    
+    # Recreate loop if closed
+    if loop.is_closed():
+        print("Loop was closed! Recreating...")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        threading.Thread(target=run_bot, daemon=True).start()
+        return "Reconnecting...", 503
+    
     if application is None:
         return "Application not ready", 503
 
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, application.bot)
-
+        
         future = asyncio.run_coroutine_threadsafe(
             application.process_update(update),
-            webhook_loop
+            loop
         )
         future.result(timeout=15)
-
         return "OK", 200
     except asyncio.TimeoutError:
-        print("Webhook processing timed out")
         return "Timeout", 504
     except Exception as e:
         print(f"Webhook error: {e}")
@@ -264,7 +273,6 @@ def escape_md(text):
     """Escape Markdown special characters for Telegram messages"""
     if not text:
         return text
-    # Characters that need escaping in Markdown
     chars = ['_', '*', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
     for c in chars:
         text = text.replace(c, f'\\{c}')
@@ -659,6 +667,20 @@ async def safe_edit(query, text, reply_markup=None, parse_mode=None):
         else:
             raise e
 
+# ============ ERROR HANDLER ============
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors and prevent crashes"""
+    try:
+        raise context.error
+    except NetworkError as e:
+        print(f"Network error: {e}")
+    except BadRequest as e:
+        print(f"Bad request: {e}")
+    except Exception as e:
+        print(f"Unhandled error: {e}")
+        import traceback
+        traceback.print_exc()
+
 # ============ HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1049,7 +1071,6 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"\nVirusTotal:\n"
         msg += f"   {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            # ✅ FIX: Escape markdown characters in the link
             msg += f"   View Report: {escape_md(vt_result['link'])}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
@@ -1138,7 +1159,6 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_icon = "Clean" if vt_result['clean'] else "Detected"
         msg += f"\nVirusTotal: {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            # ✅ FIX: Escape markdown characters in the link
             msg += f"View Report: {escape_md(vt_result['link'])}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
@@ -1279,7 +1299,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ BOT RUNNER ============
 def run_bot():
-    global application, webhook_loop
+    global application, loop
 
     async def bot_main():
         global application
@@ -1291,6 +1311,9 @@ def run_bot():
         print(f"Admin ID: {ADMIN_CHAT_ID}")
 
         application = Application.builder().token(BOT_TOKEN).build()
+
+        # Add error handler
+        application.add_error_handler(error_handler)
 
         conv = ConversationHandler(
             entry_points=[
@@ -1338,9 +1361,18 @@ def run_bot():
         print("Bot is running!")
 
         while True:
+            try:
+                if not application.running:
+                    print("Application stopped! Re-initializing...")
+                    await application.initialize()
+                    await application.start()
+                    print("Application re-initialized.")
+            except Exception as e:
+                print(f"Health check error: {e}")
             await asyncio.sleep(10)
 
-    webhook_loop.run_until_complete(bot_main())
+    # Run on persistent loop
+    loop.run_until_complete(bot_main())
 
 # ============ MAIN ============
 if __name__ == '__main__':
@@ -1356,5 +1388,9 @@ if __name__ == '__main__':
         port = int(os.environ.get("PORT", 8080))
         app.run(host='0.0.0.0', port=port)
 
-    threading.Thread(target=run_flask, daemon=True).start()
+    # Start Flask in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Start bot
     run_bot()
