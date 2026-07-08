@@ -1279,6 +1279,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ============ BOT RUNNER — POLLING MODE ============
+# ============ BOT RUNNER — POLLING MODE WITH CONFLICT RECOVERY ============
 def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1305,7 +1306,7 @@ def run_bot():
             ],
             states={
                 WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token)],
-                WAITING_APK: [MessageHandler(filters.Document.ALL, handle_apk)],  # ALL to catch all documents
+                WAITING_APK: [MessageHandler(filters.Document.ALL, handle_apk)],
                 WAITING_EXE: [MessageHandler(filters.Document.ALL, handle_exe)],
                 WAITING_DOC: [MessageHandler(filters.Document.ALL, handle_doc)],
                 WAITING_GENERATE_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_generate_token)],
@@ -1318,37 +1319,66 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
-        # Delete webhook to avoid conflicts
-        print("Deleting webhook...")
-        try:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            print("Webhook deleted.")
-        except Exception as e:
-            print(f"Delete webhook error: {e}")
+        # ✅ Force delete webhook with retries
+        for attempt in range(5):
+            try:
+                print(f"Deleting webhook (attempt {attempt+1}/5)...")
+                await application.bot.delete_webhook(drop_pending_updates=True)
+                print("Webhook deletion successful.")
+                break
+            except Exception as e:
+                print(f"Delete webhook attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(2)
+        else:
+            print("Warning: Could not delete webhook after 5 attempts. Continuing anyway.")
 
-        await asyncio.sleep(2)
+        # Wait for any lingering connections to close
+        await asyncio.sleep(3)
+
+        # Check webhook status
+        try:
+            webhook_info = await application.bot.get_webhook_info()
+            print(f"Webhook URL after deletion: {webhook_info.url or 'None'}")
+            print(f"Pending updates: {webhook_info.pending_update_count}")
+        except Exception as e:
+            print(f"Could not get webhook info: {e}")
+
+        # ✅ Force delete again if still set
+        if webhook_info and webhook_info.url:
+            print("Webhook still set! Force deleting with drop_pending_updates...")
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            await asyncio.sleep(2)
 
         print("Starting polling with long timeouts...")
         await application.initialize()
         await application.start()
 
-        # Poll with extended timeouts for APK processing
-        await application.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=['message', 'callback_query'],
-            poll_interval=1.0,
-            timeout=120,
-            read_timeout=120,
-            write_timeout=120,
-            connect_timeout=60
-        )
+        # ✅ Use a unique session file to avoid conflicts (if running multiple instances)
+        # But the conflict is at Telegram level, not local.
 
-        print("Bot is running!")
+        # Start polling with error recovery
+        try:
+            await application.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=['message', 'callback_query'],
+                poll_interval=1.0,
+                timeout=120,
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=60
+            )
+            print("Bot is running!")
+        except Exception as e:
+            print(f"Polling startup error: {e}")
+            raise
 
+        # Keep alive with health check
         while True:
             try:
                 if not application.updater.running:
                     print("Updater stopped! Restarting...")
+                    # Before restarting, delete webhook again to avoid conflict
+                    await application.bot.delete_webhook(drop_pending_updates=True)
                     await application.updater.start_polling(
                         drop_pending_updates=True,
                         allowed_updates=['message', 'callback_query'],
@@ -1363,7 +1393,7 @@ def run_bot():
                 print(f"Health check error: {e}")
             await asyncio.sleep(10)
 
-    # Run with retry
+    # Run with retry loop for bot_main
     while True:
         try:
             loop.run_until_complete(bot_main())
@@ -1371,11 +1401,11 @@ def run_bot():
             print(f"Bot crashed: {e}")
             import traceback
             traceback.print_exc()
-            print("Restarting in 5 seconds...")
-            time.sleep(5)
+            print("Restarting in 10 seconds...")
+            time.sleep(10)
+            # Recreate loop to avoid closed loop issues
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-
 # ============ MAIN ============
 if __name__ == '__main__':
     print("""
@@ -1388,7 +1418,8 @@ if __name__ == '__main__':
 
     def run_flask():
         port = int(os.environ.get("PORT", 8080))
-        app.run(host='0.0.0.0', port=port, debug=False)
+        # Use debug=False, and don't use reloader
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
     # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
