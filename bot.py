@@ -15,7 +15,7 @@ import tempfile
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler, ContextTypes
 from telegram.error import BadRequest
@@ -28,6 +28,7 @@ ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
 DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
 VT_API_KEY = os.environ.get("VT_API_KEY", "")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
 if not os.path.exists(DATA_DIR):
     DATA_DIR = "data"
@@ -44,6 +45,7 @@ DEVELOPER = "@benji_v1"
 # ============ FLASK ============
 app = Flask(__name__)
 start_time = time.time()
+application = None  # Will be set later
 
 @app.route('/')
 def index():
@@ -52,6 +54,29 @@ def index():
 @app.route('/health')
 def health():
     return jsonify({"status": "ok"})
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle incoming Telegram updates via webhook"""
+    global application
+    if application is None:
+        return "Application not ready", 503
+
+    try:
+        # Parse the update
+        data = request.get_json(force=True)
+        update = Update.de_json(data, application.bot)
+        
+        # Process asynchronously
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(application.process_update(update))
+        loop.close()
+        
+        return "OK", 200
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return f"Error: {e}", 500
 
 # ============ DATABASE ============
 def init_db():
@@ -607,7 +632,6 @@ def is_admin(user_id):
 
 # ============ SAFE EDIT ============
 async def safe_edit(query, text, reply_markup=None, parse_mode=None):
-    """Safely edit a message, catching 'Message is not modified' error"""
     try:
         if reply_markup:
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -615,7 +639,6 @@ async def safe_edit(query, text, reply_markup=None, parse_mode=None):
             await query.edit_message_text(text, parse_mode=parse_mode)
     except BadRequest as e:
         if "Message is not modified" in str(e):
-            # Just answer the callback to acknowledge
             await query.answer("Already on this page")
         else:
             raise e
@@ -1236,21 +1259,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled. Send /start to begin.")
     return ConversationHandler.END
 
-# ============ BOT RUNNER ============
+# ============ BOT RUNNER — WEBHOOK MODE ============
 def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    global application
 
     async def bot_main():
+        global application
         init_db()
-        print("FUD Maker Bot starting...")
+        print("FUD Maker Bot starting (Webhook mode)...")
         print(f"Developer: {DEVELOPER}")
         print(f"VirusTotal: {'Enabled' if VT_API_KEY else 'Disabled'}")
         print(f"Channel: {'Configured' if CHANNEL_ID else 'Not set'}")
         print(f"Admin ID: {ADMIN_CHAT_ID}")
 
+        # Build application
         application = Application.builder().token(BOT_TOKEN).build()
 
+        # Add handlers
         conv = ConversationHandler(
             entry_points=[
                 CommandHandler('start', start),
@@ -1272,62 +1297,39 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
-        # Force delete webhook with retry
-        print("Deleting webhook...")
-        for attempt in range(5):
-            try:
-                await application.bot.delete_webhook(drop_pending_updates=True)
-                print(f"Webhook deleted (attempt {attempt + 1})")
-                break
-            except Exception as e:
-                print(f"Attempt {attempt + 1} failed: {e}")
-                await asyncio.sleep(2)
-
-        await asyncio.sleep(3)
-
-        webhook_info = await application.bot.get_webhook_info()
-        print(f"Webhook URL: {webhook_info.url or 'None'}")
-        print(f"Pending updates: {webhook_info.pending_update_count}")
-
-        print("Starting bot polling...")
+        # Initialize
         await application.initialize()
         await application.start()
 
-        await application.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=['message', 'callback_query'],
-            poll_interval=1.0,
-            timeout=10
-        )
+        # Set webhook
+        if WEBHOOK_URL:
+            webhook_full = f"{WEBHOOK_URL}"
+            print(f"Setting webhook to: {webhook_full}")
+            await application.bot.set_webhook(
+                url=webhook_full,
+                allowed_updates=['message', 'callback_query'],
+                drop_pending_updates=True
+            )
+            print("Webhook set successfully!")
+        else:
+            print("WARNING: WEBHOOK_URL not set! Using polling (may cause conflicts)...")
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            await application.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=['message', 'callback_query'],
+                poll_interval=1.0,
+                timeout=10
+            )
 
         print("Bot is running!")
 
+        # Keep alive
         while True:
-            try:
-                if not application.updater.running:
-                    print("Updater stopped! Restarting...")
-                    await application.updater.start_polling(
-                        drop_pending_updates=True,
-                        allowed_updates=['message', 'callback_query'],
-                        poll_interval=1.0,
-                        timeout=10
-                    )
-                    print("Updater restarted!")
-            except Exception as e:
-                print(f"Health check error: {e}")
             await asyncio.sleep(10)
 
-    while True:
-        try:
-            loop.run_until_complete(bot_main())
-        except Exception as e:
-            print(f"Bot crashed: {e}")
-            import traceback
-            traceback.print_exc()
-            print("Restarting in 5 seconds...")
-            time.sleep(5)
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(bot_main())
 
 # ============ MAIN ============
 if __name__ == '__main__':
