@@ -1005,7 +1005,7 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"\nVirusTotal:\n"
         msg += f"   {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            msg += f"   View Report: {vt_result['link']}"
+            msg += f"   View Report: {escape_md(vt_result['link'])}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1093,7 +1093,7 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_icon = "Clean" if vt_result['clean'] else "Detected"
         msg += f"\nVirusTotal: {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            msg += f"View Report: {vt_result['link']}"
+            msg += f"View Report: {escape_md(vt_result['link'])}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
