@@ -663,7 +663,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔐 FUD APK/EXE/DOC Maker\n\n"
         "This bot is private. Access requires a valid token.\n\n"
-        "👨‍💻 Contact developer:\n@benji_v1\n\n"
+        "👨‍💻 Contact developer:\n @benji_v1\n\n"
         "If you have a token, send it now.\n"
         "For instructions, type /help",
         reply_markup=InlineKeyboardMarkup(keyboard),
